@@ -315,24 +315,34 @@ class MIDIPlayer(QThread):
 
     def run(self):
         """Play notes using pygame MIDI"""
+        midi_out = None
         try:
+            import pygame
             import pygame.midi
 
+            # Initialize pygame first
+            if not pygame.get_init():
+                pygame.init()
+
             # Initialize pygame.midi
-            pygame.midi.init()
+            if not pygame.midi.get_init():
+                pygame.midi.init()
 
             # Get default MIDI output device
             default_output = pygame.midi.get_default_output_id()
             if default_output == -1:
                 self.error.emit("No MIDI output device found. Please check your system audio settings.")
-                pygame.midi.quit()
                 return
 
-            # Open MIDI output
-            midi_out = pygame.midi.Output(default_output)
+            # Open MIDI output with error handling
+            try:
+                midi_out = pygame.midi.Output(default_output, latency=0)
+            except Exception as e:
+                self.error.emit(f"Failed to open MIDI device: {str(e)}\n\nTry installing a software synthesizer like FluidSynth or TiMidity.")
+                return
 
-            # Set instrument to piano (program 0)
-            midi_out.set_instrument(0)
+            # Set instrument to piano (program 0) using program change
+            midi_out.write_short(0xC0, 0)  # Program change, channel 0, piano
 
             self.progress.emit(f"Playing {len(self.notes_to_play)} notes...")
 
@@ -343,16 +353,19 @@ class MIDIPlayer(QThread):
 
                 # Convert note name to MIDI number
                 try:
-                    midi_note = librosa.note_to_midi(note['note'])
+                    midi_note = int(librosa.note_to_midi(note['note']))
                 except:
                     continue  # Skip invalid notes
+
+                # Clamp MIDI note to valid range (0-127)
+                midi_note = max(0, min(127, midi_note))
 
                 # Calculate duration with tempo adjustment
                 duration = note['duration'] / self.tempo_multiplier
 
-                # Play note
+                # Play note using write_short
                 velocity = 100  # Volume (0-127)
-                midi_out.note_on(midi_note, velocity)
+                midi_out.write_short(0x90, midi_note, velocity)  # Note on, channel 0
 
                 # Update progress
                 self.progress.emit(f"Playing note {i+1}/{len(self.notes_to_play)}: {note['note']}")
@@ -361,18 +374,14 @@ class MIDIPlayer(QThread):
                 time.sleep(duration)
 
                 # Stop note
-                midi_out.note_off(midi_note, velocity)
+                midi_out.write_short(0x80, midi_note, 0)  # Note off, channel 0
 
-                # Small gap between notes (unless this would overlap with the next note)
+                # Small gap between notes
                 if i < len(self.notes_to_play) - 1:
                     next_note = self.notes_to_play[i + 1]
                     gap = (next_note['time'] - (note['time'] + note['duration'])) / self.tempo_multiplier
                     if gap > 0:
                         time.sleep(gap)
-
-            # Clean up
-            midi_out.close()
-            pygame.midi.quit()
 
             if not self.stop_flag:
                 self.progress.emit("Playback complete!")
@@ -383,7 +392,21 @@ class MIDIPlayer(QThread):
         except ImportError:
             self.error.emit("pygame not installed. Please run:\npip install pygame")
         except Exception as e:
-            self.error.emit(f"MIDI playback error: {str(e)}")
+            import traceback
+            error_details = traceback.format_exc()
+            self.error.emit(f"MIDI playback error: {str(e)}\n\nDetails:\n{error_details}")
+        finally:
+            # Clean up - always close the MIDI device
+            if midi_out is not None:
+                try:
+                    midi_out.close()
+                except:
+                    pass
+            try:
+                if pygame.midi.get_init():
+                    pygame.midi.quit()
+            except:
+                pass
 
     def stop(self):
         """Stop MIDI playback"""
