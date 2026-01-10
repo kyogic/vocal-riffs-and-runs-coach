@@ -84,6 +84,32 @@ class YouTubeDownloader(QThread):
             self.error.emit(f'Download error: {str(e)}')
 
 
+class PitchAnalysisThread(QThread):
+    """Background thread for pitch analysis"""
+    progress = pyqtSignal(str)  # Progress message
+    finished = pyqtSignal(list, object, object)  # notes, times, f0
+    error = pyqtSignal(str)  # Error message
+
+    def __init__(self, audio, sr):
+        super().__init__()
+        self.audio = audio
+        self.sr = sr
+
+    def run(self):
+        """Analyze pitch in background"""
+        try:
+            self.progress.emit('Analyzing pitch...')
+
+            pitch_detector = PitchDetector(self.sr)
+            notes, times, f0 = pitch_detector.get_note_data(self.audio)
+
+            self.progress.emit(f'Analysis complete! Detected {len(notes)} notes')
+            self.finished.emit(notes, times, f0)
+
+        except Exception as e:
+            self.error.emit(f'Analysis error: {str(e)}')
+
+
 class PitchDetector:
     """Handles pitch detection from audio data"""
 
@@ -229,8 +255,8 @@ class AudioPlayer(QThread):
                 self.current_position = initial_position + elapsed_time
                 self.position_changed.emit(self.current_position)
 
-                # Update every 100ms instead of 50ms to reduce GUI load
-                self.msleep(100)
+                # Update every 500ms to minimize GUI impact
+                self.msleep(500)
 
             # Wait for playback to finish if not stopped
             if not self.stop_flag:
@@ -279,6 +305,10 @@ class VisualizationWidget(FigureCanvas):
         self.notes = None
         self.current_time = 0
 
+        # Store position line references for fast updates
+        self.position_line1 = None
+        self.position_line2 = None
+
     def update_data(self, audio, sr, times, f0, notes):
         """Update visualization with new data"""
         self.audio = audio
@@ -304,8 +334,8 @@ class VisualizationWidget(FigureCanvas):
         self.ax1.set_title('Waveform')
         self.ax1.set_xlim(0, len(self.audio) / self.sr)
 
-        # Plot current position line
-        self.ax1.axvline(x=self.current_time, color='r', linestyle='--', linewidth=2)
+        # Plot current position line and store reference
+        self.position_line1 = self.ax1.axvline(x=self.current_time, color='r', linestyle='--', linewidth=2)
 
         # Plot pitch
         if self.f0 is not None and self.times is not None:
@@ -340,15 +370,30 @@ class VisualizationWidget(FigureCanvas):
         self.ax2.set_xlim(0, len(self.audio) / self.sr if self.audio is not None else 10)
         self.ax2.legend()
 
-        # Plot current position line
-        self.ax2.axvline(x=self.current_time, color='r', linestyle='--', linewidth=2)
+        # Plot current position line and store reference
+        self.position_line2 = self.ax2.axvline(x=self.current_time, color='r', linestyle='--', linewidth=2)
 
         self.draw()
 
     def update_position(self, time):
-        """Update current playback position"""
+        """Update current playback position - optimized to only move the line"""
         self.current_time = time
-        self.plot()
+
+        # Only update if we have position lines (after initial plot)
+        if self.position_line1 is not None and self.position_line2 is not None:
+            try:
+                # Update position lines without full redraw
+                self.position_line1.set_xdata([time, time])
+                self.position_line2.set_xdata([time, time])
+
+                # Draw only the updated parts (much faster)
+                self.draw()
+            except:
+                # If update fails, do full redraw
+                self.plot()
+        else:
+            # Initial plot
+            self.plot()
 
 
 class VocalCoachApp(QMainWindow):
@@ -601,25 +646,41 @@ class VocalCoachApp(QMainWindow):
         if self.audio is None:
             return
 
-        try:
-            self.statusBar().showMessage('Analyzing pitch...')
-            QApplication.processEvents()
+        # Disable analyze button during analysis
+        self.analyze_btn.setEnabled(False)
+        self.statusBar().showMessage('Starting pitch analysis...')
 
-            # Detect pitch and notes
-            notes, times, f0 = self.pitch_detector.get_note_data(self.audio)
-            self.notes_data = notes
+        # Create and start analysis thread
+        self.analysis_thread = PitchAnalysisThread(self.audio, self.sr)
+        self.analysis_thread.progress.connect(self.on_analysis_progress)
+        self.analysis_thread.finished.connect(self.on_analysis_finished)
+        self.analysis_thread.error.connect(self.on_analysis_error)
+        self.analysis_thread.start()
 
-            # Update visualization
-            self.viz_widget.update_data(self.audio, self.sr, times, f0, notes)
+    def on_analysis_progress(self, message):
+        """Handle analysis progress updates"""
+        self.statusBar().showMessage(message)
 
-            # Enable export
-            self.export_btn.setEnabled(True)
+    def on_analysis_finished(self, notes, times, f0):
+        """Handle completed analysis"""
+        self.analyze_btn.setEnabled(True)
 
-            self.statusBar().showMessage(f'Analysis complete! Detected {len(notes)} notes', 3000)
+        # Store notes data
+        self.notes_data = notes
 
-        except Exception as e:
-            self.statusBar().showMessage(f'Error analyzing pitch: {str(e)}')
-            print(f"Error analyzing pitch: {e}")
+        # Update visualization
+        self.viz_widget.update_data(self.audio, self.sr, times, f0, notes)
+
+        # Enable export
+        self.export_btn.setEnabled(True)
+
+        self.statusBar().showMessage(f'Analysis complete! Detected {len(notes)} notes', 3000)
+
+    def on_analysis_error(self, error_msg):
+        """Handle analysis errors"""
+        self.analyze_btn.setEnabled(True)
+        self.statusBar().showMessage(f'Error analyzing pitch: {error_msg}')
+        print(f"Error analyzing pitch: {error_msg}")
 
     def toggle_play(self):
         """Toggle play/pause"""
