@@ -87,7 +87,7 @@ class YouTubeDownloader(QThread):
 class PitchAnalysisThread(QThread):
     """Background thread for pitch analysis"""
     progress = pyqtSignal(str)  # Progress message
-    finished = pyqtSignal(list, object, object)  # notes, times, f0
+    finished = pyqtSignal(list, object, object, list)  # notes, times, f0, runs
     error = pyqtSignal(str)  # Error message
 
     def __init__(self, audio, sr):
@@ -103,8 +103,12 @@ class PitchAnalysisThread(QThread):
             pitch_detector = PitchDetector(self.sr)
             notes, times, f0 = pitch_detector.get_note_data(self.audio)
 
-            self.progress.emit(f'Analysis complete! Detected {len(notes)} notes')
-            self.finished.emit(notes, times, f0)
+            self.progress.emit('Detecting vocal runs...')
+            runs_detector = RunsDetector()
+            runs = runs_detector.detect_runs(notes)
+
+            self.progress.emit(f'Analysis complete! Detected {len(notes)} notes and {len(runs)} runs')
+            self.finished.emit(notes, times, f0, runs)
 
         except Exception as e:
             self.error.emit(f'Analysis error: {str(e)}')
@@ -193,6 +197,92 @@ class PitchDetector:
                     note_start = None
 
         return notes, times, f0
+
+
+class RunsDetector:
+    """Detects vocal runs and riffs from note sequences"""
+
+    def __init__(self, min_notes=4, max_note_duration=0.4, max_gap=0.2):
+        """
+        Initialize runs detector
+
+        Args:
+            min_notes: Minimum number of consecutive notes to be considered a run
+            max_note_duration: Maximum duration per note in a run (seconds)
+            max_gap: Maximum time gap between notes in a run (seconds)
+        """
+        self.min_notes = min_notes
+        self.max_note_duration = max_note_duration
+        self.max_gap = max_gap
+
+    def detect_runs(self, notes):
+        """
+        Detect vocal runs from a list of notes
+
+        Returns:
+            List of run dictionaries with start_time, end_time, notes, note_count
+        """
+        if len(notes) < self.min_notes:
+            return []
+
+        runs = []
+        current_run = []
+
+        for i, note in enumerate(notes):
+            # Check if this note could be part of a run
+            is_run_note = note['duration'] <= self.max_note_duration
+
+            # Check gap from previous note
+            if current_run:
+                prev_note = current_run[-1]
+                gap = note['time'] - (prev_note['time'] + prev_note['duration'])
+                gap_ok = gap <= self.max_gap
+            else:
+                gap_ok = True
+
+            if is_run_note and gap_ok:
+                # Add to current run
+                current_run.append(note)
+            else:
+                # End current run if it's long enough
+                if len(current_run) >= self.min_notes:
+                    runs.append(self._create_run_info(current_run))
+
+                # Start new run if this note qualifies
+                if is_run_note:
+                    current_run = [note]
+                else:
+                    current_run = []
+
+        # Don't forget the last run
+        if len(current_run) >= self.min_notes:
+            runs.append(self._create_run_info(current_run))
+
+        return runs
+
+    def _create_run_info(self, run_notes):
+        """Create a run info dictionary from a list of notes"""
+        start_time = run_notes[0]['time']
+        last_note = run_notes[-1]
+        end_time = last_note['time'] + last_note['duration']
+
+        # Calculate average note duration
+        avg_duration = sum(n['duration'] for n in run_notes) / len(run_notes)
+
+        # Get note range
+        note_names = [n['note'] for n in run_notes]
+
+        return {
+            'start_time': start_time,
+            'end_time': end_time,
+            'duration': end_time - start_time,
+            'note_count': len(run_notes),
+            'notes': run_notes,
+            'note_names': note_names,
+            'avg_note_duration': avg_duration,
+            'first_note': note_names[0],
+            'last_note': note_names[-1]
+        }
 
 
 class AudioPlayer(QThread):
@@ -303,19 +393,21 @@ class VisualizationWidget(FigureCanvas):
         self.audio = None
         self.f0 = None
         self.notes = None
+        self.runs = []
         self.current_time = 0
 
         # Store position line references for fast updates
         self.position_line1 = None
         self.position_line2 = None
 
-    def update_data(self, audio, sr, times, f0, notes):
+    def update_data(self, audio, sr, times, f0, notes, runs=None):
         """Update visualization with new data"""
         self.audio = audio
         self.sr = sr
         self.times = times
         self.f0 = f0
         self.notes = notes
+        self.runs = runs if runs is not None else []
         self.plot()
 
     def plot(self):
@@ -331,7 +423,21 @@ class VisualizationWidget(FigureCanvas):
         time_axis = np.linspace(0, len(self.audio) / self.sr, len(self.audio))
         self.ax1.plot(time_axis, self.audio, linewidth=0.5, alpha=0.7)
         self.ax1.set_ylabel('Amplitude')
-        self.ax1.set_title('Waveform')
+
+        # Highlight runs in waveform
+        title = 'Waveform'
+        if self.runs:
+            for run in self.runs:
+                self.ax1.axvspan(
+                    run['start_time'],
+                    run['end_time'],
+                    alpha=0.2,
+                    color='orange',
+                    label='Vocal Run' if run == self.runs[0] else ''
+                )
+            title = f'Waveform (🎵 {len(self.runs)} runs detected)'
+
+        self.ax1.set_title(title)
         self.ax1.set_xlim(0, len(self.audio) / self.sr)
 
         # Plot current position line and store reference
@@ -364,9 +470,39 @@ class VisualizationWidget(FigureCanvas):
                         fontweight='bold'
                     )
 
+            # Highlight vocal runs with thick borders
+            if self.runs:
+                for i, run in enumerate(self.runs):
+                    # Add thick orange border around runs
+                    self.ax2.axvspan(
+                        run['start_time'],
+                        run['end_time'],
+                        alpha=0.3,
+                        color='orange',
+                        linewidth=3,
+                        edgecolor='darkorange',
+                        linestyle='--'
+                    )
+                    # Add run label at the top
+                    y_max = self.ax2.get_ylim()[1]
+                    self.ax2.text(
+                        (run['start_time'] + run['end_time']) / 2,
+                        y_max * 0.95,
+                        f"RUN {i+1}\n({run['note_count']} notes)",
+                        ha='center',
+                        va='top',
+                        fontsize=9,
+                        fontweight='bold',
+                        color='darkorange',
+                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
+                    )
+
         self.ax2.set_xlabel('Time (s)')
         self.ax2.set_ylabel('Frequency (Hz)')
-        self.ax2.set_title('Detected Pitch and Notes')
+        pitch_title = 'Detected Pitch and Notes'
+        if self.runs:
+            pitch_title += f' (🎵 {len(self.runs)} runs highlighted)'
+        self.ax2.set_title(pitch_title)
         self.ax2.set_xlim(0, len(self.audio) / self.sr if self.audio is not None else 10)
         self.ax2.legend()
 
@@ -408,6 +544,8 @@ class VocalCoachApp(QMainWindow):
         self.audio_player = AudioPlayer()
         self.is_playing = False
         self.notes_data = []
+        self.runs_data = []
+        self.current_run_index = 0
 
         # Connect player signals
         self.audio_player.position_changed.connect(self.on_position_changed)
@@ -507,6 +645,34 @@ class VocalCoachApp(QMainWindow):
         controls_layout.addStretch()
 
         layout.addLayout(controls_layout)
+
+        # Runs navigation controls
+        runs_layout = QHBoxLayout()
+        runs_layout.addStretch()
+
+        self.prev_run_btn = QPushButton('⏮ Previous Run')
+        self.prev_run_btn.clicked.connect(self.go_to_prev_run)
+        self.prev_run_btn.setEnabled(False)
+
+        self.runs_label = QLabel('No runs detected')
+        self.runs_label.setAlignment(Qt.AlignCenter)
+        self.runs_label.setFont(QFont('Arial', 10))
+
+        self.next_run_btn = QPushButton('Next Run ⏭')
+        self.next_run_btn.clicked.connect(self.go_to_next_run)
+        self.next_run_btn.setEnabled(False)
+
+        self.export_runs_btn = QPushButton('💾 Export Runs Only')
+        self.export_runs_btn.clicked.connect(self.export_runs)
+        self.export_runs_btn.setEnabled(False)
+
+        runs_layout.addWidget(self.prev_run_btn)
+        runs_layout.addWidget(self.runs_label)
+        runs_layout.addWidget(self.next_run_btn)
+        runs_layout.addWidget(self.export_runs_btn)
+        runs_layout.addStretch()
+
+        layout.addLayout(runs_layout)
 
         # Status bar
         self.statusBar().showMessage('Ready')
@@ -661,20 +827,30 @@ class VocalCoachApp(QMainWindow):
         """Handle analysis progress updates"""
         self.statusBar().showMessage(message)
 
-    def on_analysis_finished(self, notes, times, f0):
+    def on_analysis_finished(self, notes, times, f0, runs):
         """Handle completed analysis"""
         self.analyze_btn.setEnabled(True)
 
-        # Store notes data
+        # Store notes and runs data
         self.notes_data = notes
+        self.runs_data = runs
+        self.current_run_index = 0
 
         # Update visualization
-        self.viz_widget.update_data(self.audio, self.sr, times, f0, notes)
+        self.viz_widget.update_data(self.audio, self.sr, times, f0, notes, runs)
 
-        # Enable export
+        # Enable export and run navigation
         self.export_btn.setEnabled(True)
+        if runs:
+            self.prev_run_btn.setEnabled(True)
+            self.next_run_btn.setEnabled(True)
+            self.export_runs_btn.setEnabled(True)
+            self.runs_label.setText(f'Run 1 of {len(runs)}')
 
-        self.statusBar().showMessage(f'Analysis complete! Detected {len(notes)} notes', 3000)
+        status_msg = f'Analysis complete! Detected {len(notes)} notes'
+        if runs:
+            status_msg += f' and {len(runs)} runs'
+        self.statusBar().showMessage(status_msg, 3000)
 
     def on_analysis_error(self, error_msg):
         """Handle analysis errors"""
@@ -829,6 +1005,100 @@ class VocalCoachApp(QMainWindow):
             except Exception as e:
                 self.statusBar().showMessage(f'Error exporting notes: {str(e)}')
                 print(f"Error exporting notes: {e}")
+
+    def go_to_prev_run(self):
+        """Navigate to previous vocal run"""
+        if not self.runs_data:
+            return
+
+        self.current_run_index = (self.current_run_index - 1) % len(self.runs_data)
+        self._jump_to_current_run()
+
+    def go_to_next_run(self):
+        """Navigate to next vocal run"""
+        if not self.runs_data:
+            return
+
+        self.current_run_index = (self.current_run_index + 1) % len(self.runs_data)
+        self._jump_to_current_run()
+
+    def _jump_to_current_run(self):
+        """Jump to the current run index"""
+        if not self.runs_data or self.current_run_index >= len(self.runs_data):
+            return
+
+        run = self.runs_data[self.current_run_index]
+
+        # Update label
+        self.runs_label.setText(f'Run {self.current_run_index + 1} of {len(self.runs_data)}')
+
+        # Seek to run start
+        self.audio_player.current_position = run['start_time']
+        self.progress_bar.setValue(int((run['start_time'] / self.duration) * 1000))
+        self.update_time_label(run['start_time'])
+        self.viz_widget.update_position(run['start_time'])
+
+        # Show run info in status bar
+        note_sequence = ' → '.join(run['note_names'])
+        self.statusBar().showMessage(
+            f"Run {self.current_run_index + 1}: {run['note_count']} notes "
+            f"({run['first_note']} to {run['last_note']}) | {note_sequence}"
+        )
+
+    def export_runs(self):
+        """Export only the detected runs"""
+        if not self.runs_data:
+            self.statusBar().showMessage('No runs to export. Please analyze first.')
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            'Export Vocal Runs',
+            'vocal_runs.txt',
+            'Text Files (*.txt);;CSV Files (*.csv);;All Files (*.*)'
+        )
+
+        if file_path:
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    if file_path.endswith('.csv'):
+                        # CSV format
+                        f.write('Run #,Start Time (s),End Time (s),Duration (s),Note Count,First Note,Last Note,Notes\n')
+                        for i, run in enumerate(self.runs_data, 1):
+                            note_sequence = ' → '.join(run['note_names'])
+                            f.write(
+                                f"{i},{run['start_time']:.3f},{run['end_time']:.3f},"
+                                f"{run['duration']:.3f},{run['note_count']},"
+                                f"{run['first_note']},{run['last_note']},\"{note_sequence}\"\n"
+                            )
+                    else:
+                        # Human-readable format
+                        f.write('Detected Vocal Runs and Riffs\n')
+                        f.write('=' * 70 + '\n\n')
+                        for i, run in enumerate(self.runs_data, 1):
+                            f.write(f"Run {i}:\n")
+                            f.write(f"  Time: {run['start_time']:.3f}s - {run['end_time']:.3f}s "
+                                  f"(duration: {run['duration']:.3f}s)\n")
+                            f.write(f"  Note Count: {run['note_count']} notes\n")
+                            f.write(f"  Range: {run['first_note']} → {run['last_note']}\n")
+                            f.write(f"  Average Note Duration: {run['avg_note_duration']:.3f}s\n")
+                            f.write(f"  Note Sequence: {' → '.join(run['note_names'])}\n")
+                            f.write('\n  Individual Notes:\n')
+                            for j, note in enumerate(run['notes'], 1):
+                                f.write(f"    {j}. {note['note']:5s} @ {note['time']:.3f}s "
+                                      f"({note['duration']:.3f}s) - {note['frequency']:.2f} Hz\n")
+                            f.write('\n' + '-' * 70 + '\n\n')
+
+                self.statusBar().showMessage(
+                    f'{len(self.runs_data)} runs exported to {os.path.basename(file_path)}', 3000
+                )
+
+                # Also enable the export runs button if not already
+                self.export_runs_btn.setEnabled(True)
+
+            except Exception as e:
+                self.statusBar().showMessage(f'Error exporting runs: {str(e)}')
+                print(f"Error exporting runs: {e}")
 
 
 def main():
