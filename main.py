@@ -306,7 +306,7 @@ class AudioSynthPlayer(QThread):
         self.notes_to_play = []
         self.tempo_multiplier = 1.0
         self.stop_flag = False
-        self.sample_rate = 22050
+        self.sample_rate = 44100  # CD quality for better sound
 
     def load_notes(self, notes, tempo_multiplier=1.0):
         """Load notes to play"""
@@ -314,10 +314,13 @@ class AudioSynthPlayer(QThread):
         self.tempo_multiplier = tempo_multiplier
         self.stop_flag = False
 
-    def generate_note_audio(self, frequency, duration, sample_rate=22050):
+    def generate_note_audio(self, frequency, duration, sample_rate=44100):
         """Generate audio waveform for a single note with envelope"""
         # Number of samples
         num_samples = int(duration * sample_rate)
+
+        if num_samples == 0:
+            return np.array([], dtype=np.float32)
 
         # Time array
         t = np.linspace(0, duration, num_samples, False)
@@ -341,11 +344,13 @@ class AudioSynthPlayer(QThread):
         note_audio += 0.3 * np.sin(2 * np.pi * frequency * 2 * t)  # Octave
         note_audio += 0.2 * np.sin(2 * np.pi * frequency * 1.5 * t)  # Fifth
 
-        # Normalize
-        note_audio = note_audio / np.max(np.abs(note_audio))
+        # Normalize to prevent clipping
+        max_val = np.max(np.abs(note_audio))
+        if max_val > 0:
+            note_audio = note_audio / max_val
 
-        # Apply volume
-        note_audio *= 0.3  # 30% volume to avoid clipping
+        # Apply volume - increased to 70% for audibility
+        note_audio *= 0.7
 
         return note_audio.astype(np.float32)
 
@@ -353,6 +358,10 @@ class AudioSynthPlayer(QThread):
         """Play notes using synthesized audio"""
         try:
             import sounddevice as sd
+
+            # Configure sounddevice for note playback
+            sd.default.blocksize = 0  # Use default blocksize for immediate playback
+            sd.default.latency = 'low'  # Low latency for note playback
 
             self.progress.emit(f"Playing {len(self.notes_to_play)} notes...")
 
@@ -369,17 +378,25 @@ class AudioSynthPlayer(QThread):
                 # Calculate duration with tempo adjustment
                 duration = note['duration'] / self.tempo_multiplier
 
+                # Skip very short notes
+                if duration < 0.01:
+                    continue
+
                 # Generate audio for this note
                 note_audio = self.generate_note_audio(frequency, duration, self.sample_rate)
+
+                # Skip if no audio generated
+                if len(note_audio) == 0:
+                    continue
 
                 # Update progress
                 self.progress.emit(f"Playing note {i+1}/{len(self.notes_to_play)}: {note['note']}")
 
-                # Play the note
+                # Play the note with blocking to ensure it finishes before next one
                 sd.play(note_audio, self.sample_rate, blocking=True)
 
                 # Gap between notes
-                if i < len(self.notes_to_play) - 1:
+                if i < len(self.notes_to_play) - 1 and not self.stop_flag:
                     next_note = self.notes_to_play[i + 1]
                     gap = (next_note['time'] - (note['time'] + note['duration'])) / self.tempo_multiplier
                     if gap > 0:
