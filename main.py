@@ -129,7 +129,7 @@ class PitchDetector:
 
     def __init__(self, sr=22050):
         self.sr = sr
-        self.hop_length = 512
+        self.hop_length = 256  # Reduced for better time resolution
         self.fmin = librosa.note_to_hz('C2')  # Lowest vocal note
         self.fmax = librosa.note_to_hz('C7')  # Highest vocal note
 
@@ -143,7 +143,8 @@ class PitchDetector:
             fmin=self.fmin,
             fmax=self.fmax,
             sr=self.sr,
-            hop_length=self.hop_length
+            hop_length=self.hop_length,
+            frame_length=2048  # Larger frame for better frequency resolution
         )
         return f0, voiced_flag, voiced_probs
 
@@ -156,6 +157,28 @@ class PitchDetector:
         note_name = librosa.midi_to_note(int(round(note_number)))
         return note_name
 
+    def median_filter_pitch(self, f0, window_size=5):
+        """Apply median filter to remove pitch tracking errors"""
+        from scipy.ndimage import median_filter
+
+        # Create a copy to work with
+        filtered_f0 = f0.copy()
+
+        # Only filter non-NaN values
+        valid_mask = ~np.isnan(f0)
+        if np.sum(valid_mask) > window_size:
+            # Get indices of valid values
+            valid_indices = np.where(valid_mask)[0]
+            valid_values = f0[valid_mask]
+
+            # Apply median filter to valid values
+            filtered_values = median_filter(valid_values, size=window_size, mode='nearest')
+
+            # Put filtered values back
+            filtered_f0[valid_indices] = filtered_values
+
+        return filtered_f0
+
     def get_note_data(self, audio):
         """
         Analyze audio and return note data with timing
@@ -163,9 +186,12 @@ class PitchDetector:
         """
         f0, voiced_flag, voiced_probs = self.detect_pitch(audio)
 
+        # Apply median filter to smooth out pitch tracking errors
+        f0_filtered = self.median_filter_pitch(f0, window_size=5)
+
         # Convert frame indices to time
         times = librosa.frames_to_time(
-            np.arange(len(f0)),
+            np.arange(len(f0_filtered)),
             sr=self.sr,
             hop_length=self.hop_length
         )
@@ -173,38 +199,57 @@ class PitchDetector:
         notes = []
         current_note = None
         note_start = None
+        freq_accumulator = []  # Accumulate frequencies for averaging
 
-        for i, (time, freq, voiced) in enumerate(zip(times, f0, voiced_flag)):
-            if voiced and not np.isnan(freq):
+        # Minimum voiced probability threshold (0.0 to 1.0)
+        min_voiced_prob = 0.5  # Only use detections with >50% confidence
+
+        for i, (time, freq, voiced, prob) in enumerate(zip(times, f0_filtered, voiced_flag, voiced_probs)):
+            # Only consider high-confidence voiced segments
+            if voiced and not np.isnan(freq) and prob >= min_voiced_prob:
                 note_name = self.frequency_to_note(freq)
+
+                # Accumulate frequency for averaging
+                freq_accumulator.append(freq)
 
                 if note_name != current_note:
                     # Save previous note if exists
-                    if current_note is not None and note_start is not None:
+                    if current_note is not None and note_start is not None and len(freq_accumulator) > 0:
                         duration = time - note_start
-                        notes.append({
-                            'time': note_start,
-                            'frequency': prev_freq,
-                            'note': current_note,
-                            'duration': duration
-                        })
+                        # Use median frequency for robustness
+                        avg_freq = np.median(freq_accumulator[:-1]) if len(freq_accumulator) > 1 else freq_accumulator[0]
+
+                        # Only save notes with minimum duration (reduces noise)
+                        if duration >= 0.02:  # At least 20ms
+                            notes.append({
+                                'time': note_start,
+                                'frequency': avg_freq,
+                                'note': current_note,
+                                'duration': duration
+                            })
 
                     # Start new note
                     current_note = note_name
                     note_start = time
-                    prev_freq = freq
+                    freq_accumulator = [freq]
             else:
                 # End of voiced segment
-                if current_note is not None and note_start is not None:
+                if current_note is not None and note_start is not None and len(freq_accumulator) > 0:
                     duration = time - note_start
-                    notes.append({
-                        'time': note_start,
-                        'frequency': prev_freq,
-                        'note': current_note,
-                        'duration': duration
-                    })
+                    # Use median frequency for robustness
+                    avg_freq = np.median(freq_accumulator)
+
+                    # Only save notes with minimum duration
+                    if duration >= 0.02:  # At least 20ms
+                        notes.append({
+                            'time': note_start,
+                            'frequency': avg_freq,
+                            'note': current_note,
+                            'duration': duration
+                        })
                     current_note = None
                     note_start = None
+                    freq_accumulator = []
 
         return notes, times, f0
 
