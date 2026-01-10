@@ -325,32 +325,39 @@ class AudioSynthPlayer(QThread):
         # Time array
         t = np.linspace(0, duration, num_samples, False)
 
-        # Generate sine wave at the given frequency
-        note_audio = np.sin(2 * np.pi * frequency * t)
+        # Generate sine wave at the given frequency (fundamental)
+        note_audio = 0.6 * np.sin(2 * np.pi * frequency * t)
+
+        # Add harmonics for richer sound (but quieter to prevent clipping)
+        note_audio += 0.25 * np.sin(2 * np.pi * frequency * 2 * t)  # Octave
+        note_audio += 0.15 * np.sin(2 * np.pi * frequency * 1.5 * t)  # Fifth
 
         # Apply ADSR envelope for more natural sound
-        # Attack (10ms ramp up)
-        attack_samples = int(0.01 * sample_rate)
+        # Attack (20ms ramp up - longer to reduce clicks)
+        attack_samples = int(0.02 * sample_rate)
         if num_samples > attack_samples:
-            note_audio[:attack_samples] *= np.linspace(0, 1, attack_samples)
+            attack_envelope = np.linspace(0, 1, attack_samples)
+            note_audio[:attack_samples] *= attack_envelope
 
-        # Release (50ms ramp down at end)
-        release_samples = int(0.05 * sample_rate)
+        # Release (100ms ramp down at end - longer for smoother end)
+        release_samples = int(0.1 * sample_rate)
         if num_samples > release_samples:
-            note_audio[-release_samples:] *= np.linspace(1, 0, release_samples)
+            release_envelope = np.linspace(1, 0, release_samples)
+            note_audio[-release_samples:] *= release_envelope
 
-        # Add harmonics for richer piano-like sound
-        # Add octave and fifth
-        note_audio += 0.3 * np.sin(2 * np.pi * frequency * 2 * t)  # Octave
-        note_audio += 0.2 * np.sin(2 * np.pi * frequency * 1.5 * t)  # Fifth
+        # Apply a gentle overall envelope to ensure smooth start and end
+        if num_samples > 100:
+            # Smooth first and last 50 samples
+            note_audio[:50] *= np.linspace(0, 1, 50) ** 2
+            note_audio[-50:] *= np.linspace(1, 0, 50) ** 2
 
-        # Normalize to prevent clipping
+        # Normalize carefully
         max_val = np.max(np.abs(note_audio))
-        if max_val > 0:
+        if max_val > 0.001:  # Avoid division by very small numbers
             note_audio = note_audio / max_val
 
-        # Apply volume - increased to 70% for audibility
-        note_audio *= 0.7
+        # Reduce volume to prevent clipping
+        note_audio *= 0.5
 
         return note_audio.astype(np.float32)
 
@@ -358,10 +365,6 @@ class AudioSynthPlayer(QThread):
         """Play notes using synthesized audio"""
         try:
             import sounddevice as sd
-
-            # Configure sounddevice for note playback
-            sd.default.blocksize = 0  # Use default blocksize for immediate playback
-            sd.default.latency = 'low'  # Low latency for note playback
 
             self.progress.emit(f"Playing {len(self.notes_to_play)} notes...")
 
@@ -378,8 +381,8 @@ class AudioSynthPlayer(QThread):
                 # Calculate duration with tempo adjustment
                 duration = note['duration'] / self.tempo_multiplier
 
-                # Skip very short notes
-                if duration < 0.01:
+                # Skip very short notes (less than 50ms)
+                if duration < 0.05:
                     continue
 
                 # Generate audio for this note
@@ -392,15 +395,16 @@ class AudioSynthPlayer(QThread):
                 # Update progress
                 self.progress.emit(f"Playing note {i+1}/{len(self.notes_to_play)}: {note['note']}")
 
-                # Play the note with blocking to ensure it finishes before next one
-                sd.play(note_audio, self.sample_rate, blocking=True)
+                # Play the note with proper buffer settings
+                # Use larger blocksize to prevent crackling
+                sd.play(note_audio, self.sample_rate, blocksize=4096, device=None)
 
-                # Gap between notes
+                # Wait for playback to complete
+                sd.wait()
+
+                # Small gap between notes for clarity
                 if i < len(self.notes_to_play) - 1 and not self.stop_flag:
-                    next_note = self.notes_to_play[i + 1]
-                    gap = (next_note['time'] - (note['time'] + note['duration'])) / self.tempo_multiplier
-                    if gap > 0:
-                        time.sleep(gap)
+                    time.sleep(0.05)  # 50ms gap between notes
 
             if not self.stop_flag:
                 self.progress.emit("Playback complete!")
