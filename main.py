@@ -90,6 +90,7 @@ class YouTubeDownloader(QThread):
 class PitchAnalysisThread(QThread):
     """Background thread for pitch analysis"""
     progress = pyqtSignal(str)  # Progress message
+    progress_percent = pyqtSignal(int)  # Progress percentage (0-100)
     finished = pyqtSignal(list, object, object, list)  # notes, times, f0, runs
     error = pyqtSignal(str)  # Error message
 
@@ -105,13 +106,16 @@ class PitchAnalysisThread(QThread):
         """Analyze pitch in background"""
         try:
             self.progress.emit('Isolating vocals from background music...')
+            self.progress_percent.emit(10)
 
             pitch_detector = PitchDetector(self.sr)
 
             self.progress.emit('Analyzing pitch from isolated vocals...')
+            self.progress_percent.emit(40)
             notes, times, f0 = pitch_detector.get_note_data(self.audio, isolate_vocals=True)
 
-            self.progress.emit('Detecting vocal runs...')
+            self.progress.emit('Detecting vocal runs and scales...')
+            self.progress_percent.emit(80)
             runs_detector = RunsDetector(
                 min_notes=self.min_notes,
                 max_note_duration=self.max_note_duration,
@@ -120,6 +124,7 @@ class PitchAnalysisThread(QThread):
             runs = runs_detector.detect_runs(notes)
 
             self.progress.emit(f'Analysis complete! Detected {len(notes)} notes and {len(runs)} runs')
+            self.progress_percent.emit(100)
             self.finished.emit(notes, times, f0, runs)
 
         except Exception as e:
@@ -332,14 +337,17 @@ class ScaleDetector:
     def detect_scale(self, note_names):
         """
         Detect which scale pattern(s) a sequence of notes belongs to
+        Uses weighted analysis based on note frequency
 
         Returns dict with scale name and confidence score
         """
         if not note_names or len(note_names) < 3:
             return {'scale': 'Unknown', 'confidence': 0.0, 'root': None}
 
-        # Convert notes to chromatic pitch classes
+        # Convert notes to chromatic pitch classes and count occurrences
+        from collections import Counter
         chromas = [self.note_to_chroma(note) for note in note_names]
+        chroma_counts = Counter(chromas)
         unique_chromas = sorted(set(chromas))
 
         # Try each possible root note
@@ -349,22 +357,40 @@ class ScaleDetector:
             # Normalize chromas relative to this root
             normalized = [(c - root) % 12 for c in unique_chromas]
 
+            # Check if root (0) is present - important for identifying the key
+            has_root = 0 in normalized
+
+            # Count how many times the root appears
+            root_weight = chroma_counts.get(root, 0) / len(note_names)
+
             # Check against each scale pattern
             for scale_name, pattern in self.scale_patterns.items():
                 # Calculate how many notes match the scale
                 matches = sum(1 for n in normalized if n in pattern)
                 total = len(unique_chromas)
 
-                confidence = matches / total if total > 0 else 0
+                # Base confidence on note matching
+                base_confidence = matches / total if total > 0 else 0
 
-                # Require at least 75% match for pentatonic, 60% for others
+                # Boost confidence if root note is present and frequent
+                if has_root and base_confidence >= 0.6:
+                    # Weight by root frequency (tonic should appear often)
+                    confidence = base_confidence * (0.7 + 0.3 * root_weight)
+                else:
+                    confidence = base_confidence * 0.8  # Penalize if root not present
+
+                # Require at least 75% match for pentatonic, 60% for 7-note scales
                 min_confidence = 0.75 if 'Pentatonic' in scale_name else 0.6
+
+                # Prioritize scales where all pattern notes are present
+                if set(normalized) == set(pattern[:len(normalized)]):
+                    confidence *= 1.1  # Boost exact matches
 
                 if confidence >= min_confidence and confidence > best_match['confidence']:
                     root_name = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'][root]
                     best_match = {
                         'scale': scale_name,
-                        'confidence': confidence,
+                        'confidence': min(confidence, 1.0),  # Cap at 100%
                         'root': root_name,
                         'notes_in_scale': matches,
                         'total_notes': total
@@ -1014,6 +1040,16 @@ class VocalCoachApp(QMainWindow):
 
         layout.addLayout(controls_layout)
 
+        # Analysis progress bar
+        self.analysis_progress = QProgressBar()
+        self.analysis_progress.setMinimum(0)
+        self.analysis_progress.setMaximum(100)
+        self.analysis_progress.setValue(0)
+        self.analysis_progress.setTextVisible(True)
+        self.analysis_progress.setFormat("Ready")
+        self.analysis_progress.setVisible(False)  # Hidden until analysis starts
+        layout.addWidget(self.analysis_progress)
+
         # Run detection settings
         settings_group = QGroupBox('Vocal Run Detection Settings')
         settings_layout = QHBoxLayout()
@@ -1284,6 +1320,11 @@ class VocalCoachApp(QMainWindow):
         self.analyze_btn.setEnabled(False)
         self.statusBar().showMessage('Starting pitch analysis...')
 
+        # Show and reset progress bar
+        self.analysis_progress.setVisible(True)
+        self.analysis_progress.setValue(0)
+        self.analysis_progress.setFormat("Starting analysis...")
+
         # Get parameters from UI
         min_notes = self.min_notes_spin.value()
         max_duration = self.max_duration_spin.value()
@@ -1294,6 +1335,7 @@ class VocalCoachApp(QMainWindow):
             self.audio, self.sr, min_notes, max_duration, max_gap
         )
         self.analysis_thread.progress.connect(self.on_analysis_progress)
+        self.analysis_thread.progress_percent.connect(self.on_analysis_progress_percent)
         self.analysis_thread.finished.connect(self.on_analysis_finished)
         self.analysis_thread.error.connect(self.on_analysis_error)
         self.analysis_thread.start()
@@ -1301,11 +1343,19 @@ class VocalCoachApp(QMainWindow):
     def on_analysis_progress(self, message):
         """Handle analysis progress updates"""
         self.statusBar().showMessage(message)
+        self.analysis_progress.setFormat(message)
+
+    def on_analysis_progress_percent(self, percent):
+        """Handle analysis progress percentage updates"""
+        self.analysis_progress.setValue(percent)
 
     def on_analysis_finished(self, notes, times, f0, runs):
         """Handle completed analysis"""
         self.analyze_btn.setEnabled(True)
         self.reanalyze_btn.setEnabled(True)
+
+        # Hide progress bar after brief delay
+        QTimer.singleShot(2000, lambda: self.analysis_progress.setVisible(False))
 
         # Store notes and runs data
         self.notes_data = notes
@@ -1350,6 +1400,7 @@ class VocalCoachApp(QMainWindow):
     def on_analysis_error(self, error_msg):
         """Handle analysis errors"""
         self.analyze_btn.setEnabled(True)
+        self.analysis_progress.setVisible(False)
         self.statusBar().showMessage(f'Error analyzing pitch: {error_msg}')
         print(f"Error analyzing pitch: {error_msg}")
 
