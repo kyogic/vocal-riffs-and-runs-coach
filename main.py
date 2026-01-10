@@ -295,8 +295,8 @@ class RunsDetector:
         }
 
 
-class MIDIPlayer(QThread):
-    """Background thread for MIDI playback of detected notes"""
+class AudioSynthPlayer(QThread):
+    """Background thread for synthesized audio playback of detected notes"""
     progress = pyqtSignal(str)  # Progress message
     finished = pyqtSignal()
     error = pyqtSignal(str)
@@ -304,8 +304,9 @@ class MIDIPlayer(QThread):
     def __init__(self):
         super().__init__()
         self.notes_to_play = []
-        self.tempo_multiplier = 1.0  # 1.0 = normal speed, 0.5 = half speed, 2.0 = double speed
+        self.tempo_multiplier = 1.0
         self.stop_flag = False
+        self.sample_rate = 22050
 
     def load_notes(self, notes, tempo_multiplier=1.0):
         """Load notes to play"""
@@ -313,36 +314,45 @@ class MIDIPlayer(QThread):
         self.tempo_multiplier = tempo_multiplier
         self.stop_flag = False
 
+    def generate_note_audio(self, frequency, duration, sample_rate=22050):
+        """Generate audio waveform for a single note with envelope"""
+        # Number of samples
+        num_samples = int(duration * sample_rate)
+
+        # Time array
+        t = np.linspace(0, duration, num_samples, False)
+
+        # Generate sine wave at the given frequency
+        note_audio = np.sin(2 * np.pi * frequency * t)
+
+        # Apply ADSR envelope for more natural sound
+        # Attack (10ms ramp up)
+        attack_samples = int(0.01 * sample_rate)
+        if num_samples > attack_samples:
+            note_audio[:attack_samples] *= np.linspace(0, 1, attack_samples)
+
+        # Release (50ms ramp down at end)
+        release_samples = int(0.05 * sample_rate)
+        if num_samples > release_samples:
+            note_audio[-release_samples:] *= np.linspace(1, 0, release_samples)
+
+        # Add harmonics for richer piano-like sound
+        # Add octave and fifth
+        note_audio += 0.3 * np.sin(2 * np.pi * frequency * 2 * t)  # Octave
+        note_audio += 0.2 * np.sin(2 * np.pi * frequency * 1.5 * t)  # Fifth
+
+        # Normalize
+        note_audio = note_audio / np.max(np.abs(note_audio))
+
+        # Apply volume
+        note_audio *= 0.3  # 30% volume to avoid clipping
+
+        return note_audio.astype(np.float32)
+
     def run(self):
-        """Play notes using pygame MIDI"""
-        midi_out = None
+        """Play notes using synthesized audio"""
         try:
-            import pygame
-            import pygame.midi
-
-            # Initialize pygame first
-            if not pygame.get_init():
-                pygame.init()
-
-            # Initialize pygame.midi
-            if not pygame.midi.get_init():
-                pygame.midi.init()
-
-            # Get default MIDI output device
-            default_output = pygame.midi.get_default_output_id()
-            if default_output == -1:
-                self.error.emit("No MIDI output device found. Please check your system audio settings.")
-                return
-
-            # Open MIDI output with error handling
-            try:
-                midi_out = pygame.midi.Output(default_output, latency=0)
-            except Exception as e:
-                self.error.emit(f"Failed to open MIDI device: {str(e)}\n\nTry installing a software synthesizer like FluidSynth or TiMidity.")
-                return
-
-            # Set instrument to piano (program 0) using program change
-            midi_out.write_short(0xC0, 0)  # Program change, channel 0, piano
+            import sounddevice as sd
 
             self.progress.emit(f"Playing {len(self.notes_to_play)} notes...")
 
@@ -351,32 +361,24 @@ class MIDIPlayer(QThread):
                 if self.stop_flag:
                     break
 
-                # Convert note name to MIDI number
-                try:
-                    midi_note = int(librosa.note_to_midi(note['note']))
-                except:
+                # Get frequency from note data
+                frequency = note.get('frequency')
+                if frequency is None or np.isnan(frequency):
                     continue  # Skip invalid notes
-
-                # Clamp MIDI note to valid range (0-127)
-                midi_note = max(0, min(127, midi_note))
 
                 # Calculate duration with tempo adjustment
                 duration = note['duration'] / self.tempo_multiplier
 
-                # Play note using write_short
-                velocity = 100  # Volume (0-127)
-                midi_out.write_short(0x90, midi_note, velocity)  # Note on, channel 0
+                # Generate audio for this note
+                note_audio = self.generate_note_audio(frequency, duration, self.sample_rate)
 
                 # Update progress
                 self.progress.emit(f"Playing note {i+1}/{len(self.notes_to_play)}: {note['note']}")
 
-                # Hold note for its duration
-                time.sleep(duration)
+                # Play the note
+                sd.play(note_audio, self.sample_rate, blocking=True)
 
-                # Stop note
-                midi_out.write_short(0x80, midi_note, 0)  # Note off, channel 0
-
-                # Small gap between notes
+                # Gap between notes
                 if i < len(self.notes_to_play) - 1:
                     next_note = self.notes_to_play[i + 1]
                     gap = (next_note['time'] - (note['time'] + note['duration'])) / self.tempo_multiplier
@@ -388,29 +390,23 @@ class MIDIPlayer(QThread):
                 self.finished.emit()
             else:
                 self.progress.emit("Playback stopped")
+                sd.stop()
 
         except ImportError:
-            self.error.emit("pygame not installed. Please run:\npip install pygame")
+            self.error.emit("sounddevice not installed. Please run:\npip install sounddevice")
         except Exception as e:
             import traceback
             error_details = traceback.format_exc()
-            self.error.emit(f"MIDI playback error: {str(e)}\n\nDetails:\n{error_details}")
-        finally:
-            # Clean up - always close the MIDI device
-            if midi_out is not None:
-                try:
-                    midi_out.close()
-                except:
-                    pass
-            try:
-                if pygame.midi.get_init():
-                    pygame.midi.quit()
-            except:
-                pass
+            self.error.emit(f"Audio playback error: {str(e)}\n\nDetails:\n{error_details}")
 
     def stop(self):
-        """Stop MIDI playback"""
+        """Stop audio playback"""
         self.stop_flag = True
+        try:
+            import sounddevice as sd
+            sd.stop()
+        except:
+            pass
 
 
 class AudioPlayer(QThread):
@@ -708,9 +704,9 @@ class VocalCoachApp(QMainWindow):
         self.duration = 0
         self.pitch_detector = PitchDetector()
         self.audio_player = AudioPlayer()
-        self.midi_player = MIDIPlayer()
+        self.note_player = AudioSynthPlayer()
         self.is_playing = False
-        self.is_playing_midi = False
+        self.is_playing_notes = False
         self.notes_data = []
         self.runs_data = []
         self.current_run_index = 0
@@ -720,10 +716,10 @@ class VocalCoachApp(QMainWindow):
         self.audio_player.finished.connect(self.on_playback_finished)
         self.audio_player.error_occurred.connect(self.on_playback_error)
 
-        # Connect MIDI player signals
-        self.midi_player.progress.connect(self.on_midi_progress)
-        self.midi_player.finished.connect(self.on_midi_finished)
-        self.midi_player.error.connect(self.on_midi_error)
+        # Connect note player signals
+        self.note_player.progress.connect(self.on_note_playback_progress)
+        self.note_player.finished.connect(self.on_note_playback_finished)
+        self.note_player.error.connect(self.on_note_playback_error)
 
         self.init_ui()
 
@@ -889,12 +885,12 @@ class VocalCoachApp(QMainWindow):
 
         layout.addLayout(runs_layout)
 
-        # MIDI Playback controls
-        midi_group = QGroupBox('MIDI Playback - Hear Detected Notes')
-        midi_layout = QHBoxLayout()
+        # Note Playback controls
+        playback_group = QGroupBox('Note Playback - Hear Detected Notes')
+        playback_layout = QHBoxLayout()
 
         # Playback speed control
-        midi_layout.addWidget(QLabel('Playback Speed:'))
+        playback_layout.addWidget(QLabel('Playback Speed:'))
         self.tempo_spin = QDoubleSpinBox()
         self.tempo_spin.setRange(0.25, 4.0)
         self.tempo_spin.setValue(1.0)
@@ -902,38 +898,38 @@ class VocalCoachApp(QMainWindow):
         self.tempo_spin.setDecimals(2)
         self.tempo_spin.setSuffix('x')
         self.tempo_spin.setToolTip('Playback speed multiplier (1.0 = normal, 0.5 = half speed, 2.0 = double speed)')
-        midi_layout.addWidget(self.tempo_spin)
+        playback_layout.addWidget(self.tempo_spin)
 
-        midi_layout.addSpacing(20)
+        playback_layout.addSpacing(20)
 
         # Play all notes button
         self.play_all_notes_btn = QPushButton('🎹 Play All Notes')
         self.play_all_notes_btn.clicked.connect(self.play_all_notes)
         self.play_all_notes_btn.setEnabled(False)
-        self.play_all_notes_btn.setToolTip('Play back all detected notes as MIDI')
-        midi_layout.addWidget(self.play_all_notes_btn)
+        self.play_all_notes_btn.setToolTip('Play back all detected notes as synthesized audio')
+        playback_layout.addWidget(self.play_all_notes_btn)
 
         # Play current run button
         self.play_run_btn = QPushButton('🎵 Play Current Run')
         self.play_run_btn.clicked.connect(self.play_current_run)
         self.play_run_btn.setEnabled(False)
         self.play_run_btn.setToolTip('Play back only the currently selected run')
-        midi_layout.addWidget(self.play_run_btn)
+        playback_layout.addWidget(self.play_run_btn)
 
-        # Stop MIDI button
-        self.stop_midi_btn = QPushButton('⏹ Stop MIDI')
-        self.stop_midi_btn.clicked.connect(self.stop_midi_playback)
-        self.stop_midi_btn.setEnabled(False)
-        midi_layout.addWidget(self.stop_midi_btn)
+        # Stop button
+        self.stop_notes_btn = QPushButton('⏹ Stop Notes')
+        self.stop_notes_btn.clicked.connect(self.stop_note_playback)
+        self.stop_notes_btn.setEnabled(False)
+        playback_layout.addWidget(self.stop_notes_btn)
 
-        # MIDI status label
-        self.midi_status_label = QLabel('')
-        self.midi_status_label.setAlignment(Qt.AlignCenter)
-        midi_layout.addWidget(self.midi_status_label)
+        # Status label
+        self.note_status_label = QLabel('')
+        self.note_status_label.setAlignment(Qt.AlignCenter)
+        playback_layout.addWidget(self.note_status_label)
 
-        midi_layout.addStretch()
-        midi_group.setLayout(midi_layout)
-        layout.addWidget(midi_group)
+        playback_layout.addStretch()
+        playback_group.setLayout(playback_layout)
+        layout.addWidget(playback_group)
 
         # Runs list panel
         runs_list_group = QGroupBox('Detected Runs')
@@ -1485,39 +1481,39 @@ class VocalCoachApp(QMainWindow):
         self.statusBar().showMessage(status_msg, 3000)
 
     def play_all_notes(self):
-        """Play all detected notes via MIDI"""
+        """Play all detected notes as synthesized audio"""
         if not self.notes_data:
             self.statusBar().showMessage('No notes to play. Please analyze first.')
             return
 
-        if self.is_playing_midi:
-            self.statusBar().showMessage('MIDI playback already in progress')
+        if self.is_playing_notes:
+            self.statusBar().showMessage('Note playback already in progress')
             return
 
         # Get tempo from UI
         tempo = self.tempo_spin.value()
 
-        # Load notes into MIDI player
-        self.midi_player.load_notes(self.notes_data, tempo)
+        # Load notes into note player
+        self.note_player.load_notes(self.notes_data, tempo)
 
         # Update UI
-        self.is_playing_midi = True
+        self.is_playing_notes = True
         self.play_all_notes_btn.setEnabled(False)
         self.play_run_btn.setEnabled(False)
-        self.stop_midi_btn.setEnabled(True)
-        self.midi_status_label.setText('Playing all notes...')
+        self.stop_notes_btn.setEnabled(True)
+        self.note_status_label.setText('Playing all notes...')
 
         # Start playback
-        self.midi_player.start()
+        self.note_player.start()
 
     def play_current_run(self):
-        """Play the current run via MIDI"""
+        """Play the current run as synthesized audio"""
         if not self.runs_data or self.current_run_index >= len(self.runs_data):
             self.statusBar().showMessage('No run selected')
             return
 
-        if self.is_playing_midi:
-            self.statusBar().showMessage('MIDI playback already in progress')
+        if self.is_playing_notes:
+            self.statusBar().showMessage('Note playback already in progress')
             return
 
         # Get current run
@@ -1526,64 +1522,64 @@ class VocalCoachApp(QMainWindow):
         # Get tempo from UI
         tempo = self.tempo_spin.value()
 
-        # Load run notes into MIDI player
-        self.midi_player.load_notes(run['notes'], tempo)
+        # Load run notes into note player
+        self.note_player.load_notes(run['notes'], tempo)
 
         # Update UI
-        self.is_playing_midi = True
+        self.is_playing_notes = True
         self.play_all_notes_btn.setEnabled(False)
         self.play_run_btn.setEnabled(False)
-        self.stop_midi_btn.setEnabled(True)
-        self.midi_status_label.setText(f'Playing run {self.current_run_index + 1}...')
+        self.stop_notes_btn.setEnabled(True)
+        self.note_status_label.setText(f'Playing run {self.current_run_index + 1}...')
 
         # Start playback
-        self.midi_player.start()
+        self.note_player.start()
 
-    def stop_midi_playback(self):
-        """Stop MIDI playback"""
-        self.midi_player.stop()
-        self.is_playing_midi = False
+    def stop_note_playback(self):
+        """Stop note playback"""
+        self.note_player.stop()
+        self.is_playing_notes = False
         self.play_all_notes_btn.setEnabled(True)
         if self.runs_data:
             self.play_run_btn.setEnabled(True)
-        self.stop_midi_btn.setEnabled(False)
-        self.midi_status_label.setText('Stopped')
+        self.stop_notes_btn.setEnabled(False)
+        self.note_status_label.setText('Stopped')
 
-    def on_midi_progress(self, message):
-        """Handle MIDI playback progress updates"""
-        self.midi_status_label.setText(message)
+    def on_note_playback_progress(self, message):
+        """Handle note playback progress updates"""
+        self.note_status_label.setText(message)
 
-    def on_midi_finished(self):
-        """Handle MIDI playback finished"""
-        self.is_playing_midi = False
+    def on_note_playback_finished(self):
+        """Handle note playback finished"""
+        self.is_playing_notes = False
         self.play_all_notes_btn.setEnabled(True)
         if self.runs_data:
             self.play_run_btn.setEnabled(True)
-        self.stop_midi_btn.setEnabled(False)
-        self.midi_status_label.setText('Playback complete')
+        self.stop_notes_btn.setEnabled(False)
+        self.note_status_label.setText('Playback complete')
 
         # Clear status after a few seconds
-        QTimer.singleShot(3000, lambda: self.midi_status_label.setText(''))
+        QTimer.singleShot(3000, lambda: self.note_status_label.setText(''))
 
-    def on_midi_error(self, error_msg):
-        """Handle MIDI playback errors"""
-        self.is_playing_midi = False
+    def on_note_playback_error(self, error_msg):
+        """Handle note playback errors"""
+        self.is_playing_notes = False
         self.play_all_notes_btn.setEnabled(True)
         if self.runs_data:
             self.play_run_btn.setEnabled(True)
-        self.stop_midi_btn.setEnabled(False)
+        self.stop_notes_btn.setEnabled(False)
 
         # Show error dialog
         msg_box = QMessageBox(self)
         msg_box.setIcon(QMessageBox.Warning)
-        msg_box.setWindowTitle('MIDI Playback Error')
-        msg_box.setText('Unable to play MIDI notes')
+        msg_box.setWindowTitle('Note Playback Error')
+        msg_box.setText('Unable to play notes')
         msg_box.setInformativeText(error_msg)
         msg_box.setStandardButtons(QMessageBox.Ok)
         msg_box.exec_()
 
-        self.midi_status_label.setText('Error')
-        self.statusBar().showMessage('MIDI playback error - see dialog for details')
+        self.note_status_label.setText('Error')
+        self.statusBar().showMessage('Note playback error - see dialog for details')
 
 
 def main():
