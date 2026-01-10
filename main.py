@@ -295,6 +295,84 @@ class PitchDetector:
         return notes, times, f0
 
 
+class ScaleDetector:
+    """Detects scale patterns in note sequences"""
+
+    def __init__(self):
+        # Define scale patterns as intervals (in semitones) from the root
+        self.scale_patterns = {
+            'Major Pentatonic': [0, 2, 4, 7, 9],  # C D E G A
+            'Minor Pentatonic': [0, 3, 5, 7, 10],  # C Eb F G Bb
+            'Major': [0, 2, 4, 5, 7, 9, 11],  # C D E F G A B
+            'Natural Minor': [0, 2, 3, 5, 7, 8, 10],  # C D Eb F G Ab Bb
+            'Harmonic Minor': [0, 2, 3, 5, 7, 8, 11],  # C D Eb F G Ab B
+            'Blues': [0, 3, 5, 6, 7, 10],  # C Eb F F# G Bb
+            'Dorian': [0, 2, 3, 5, 7, 9, 10],  # C D Eb F G A Bb
+            'Chromatic': list(range(12)),  # All 12 notes
+        }
+
+    def note_to_chroma(self, note_name):
+        """Convert note name to chromatic pitch class (0-11)"""
+        # Parse note name (e.g., "C4", "F#5", "Bb3")
+        note_map = {
+            'C': 0, 'C#': 1, 'Db': 1,
+            'D': 2, 'D#': 3, 'Eb': 3,
+            'E': 4,
+            'F': 5, 'F#': 6, 'Gb': 6,
+            'G': 7, 'G#': 8, 'Ab': 8,
+            'A': 9, 'A#': 10, 'Bb': 10,
+            'B': 11
+        }
+
+        # Remove octave number
+        note_base = note_name[:-1] if note_name[-1].isdigit() else note_name
+
+        return note_map.get(note_base, 0)
+
+    def detect_scale(self, note_names):
+        """
+        Detect which scale pattern(s) a sequence of notes belongs to
+
+        Returns dict with scale name and confidence score
+        """
+        if not note_names or len(note_names) < 3:
+            return {'scale': 'Unknown', 'confidence': 0.0, 'root': None}
+
+        # Convert notes to chromatic pitch classes
+        chromas = [self.note_to_chroma(note) for note in note_names]
+        unique_chromas = sorted(set(chromas))
+
+        # Try each possible root note
+        best_match = {'scale': 'Unknown', 'confidence': 0.0, 'root': None}
+
+        for root in range(12):
+            # Normalize chromas relative to this root
+            normalized = [(c - root) % 12 for c in unique_chromas]
+
+            # Check against each scale pattern
+            for scale_name, pattern in self.scale_patterns.items():
+                # Calculate how many notes match the scale
+                matches = sum(1 for n in normalized if n in pattern)
+                total = len(unique_chromas)
+
+                confidence = matches / total if total > 0 else 0
+
+                # Require at least 75% match for pentatonic, 60% for others
+                min_confidence = 0.75 if 'Pentatonic' in scale_name else 0.6
+
+                if confidence >= min_confidence and confidence > best_match['confidence']:
+                    root_name = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'][root]
+                    best_match = {
+                        'scale': scale_name,
+                        'confidence': confidence,
+                        'root': root_name,
+                        'notes_in_scale': matches,
+                        'total_notes': total
+                    }
+
+        return best_match
+
+
 class RunsDetector:
     """Detects vocal runs and riffs from note sequences"""
 
@@ -310,6 +388,7 @@ class RunsDetector:
         self.min_notes = min_notes
         self.max_note_duration = max_note_duration
         self.max_gap = max_gap
+        self.scale_detector = ScaleDetector()
 
     def detect_runs(self, notes):
         """
@@ -368,6 +447,9 @@ class RunsDetector:
         # Get note range
         note_names = [n['note'] for n in run_notes]
 
+        # Detect scale pattern
+        scale_info = self.scale_detector.detect_scale(note_names)
+
         return {
             'start_time': start_time,
             'end_time': end_time,
@@ -377,7 +459,10 @@ class RunsDetector:
             'note_names': note_names,
             'avg_note_duration': avg_duration,
             'first_note': note_names[0],
-            'last_note': note_names[-1]
+            'last_note': note_names[-1],
+            'scale': scale_info['scale'],
+            'scale_root': scale_info['root'],
+            'scale_confidence': scale_info['confidence']
         }
 
 
@@ -1448,11 +1533,15 @@ class VocalCoachApp(QMainWindow):
         self.update_time_label(run['start_time'])
         self.viz_widget.update_position(run['start_time'])
 
-        # Show run info in status bar
+        # Show run info in status bar with scale information
         note_sequence = ' → '.join(run['note_names'])
+        scale_text = f"{run['scale_root']} {run['scale']}" if run['scale_root'] else run['scale']
+        confidence_pct = int(run['scale_confidence'] * 100)
+
         self.statusBar().showMessage(
             f"Run {self.current_run_index + 1}: {run['note_count']} notes "
-            f"({run['first_note']} to {run['last_note']}) | {note_sequence}"
+            f"| Scale: {scale_text} ({confidence_pct}%) "
+            f"| {run['first_note']} → {run['last_note']} | {note_sequence}"
         )
 
     def export_runs(self):
@@ -1473,23 +1562,29 @@ class VocalCoachApp(QMainWindow):
                 with open(file_path, 'w', encoding='utf-8') as f:
                     if file_path.endswith('.csv'):
                         # CSV format
-                        f.write('Run #,Start Time (s),End Time (s),Duration (s),Note Count,First Note,Last Note,Notes\n')
+                        f.write('Run #,Start Time (s),End Time (s),Duration (s),Note Count,Scale,Scale Root,Confidence,First Note,Last Note,Notes\n')
                         for i, run in enumerate(self.runs_data, 1):
                             note_sequence = ' → '.join(run['note_names'])
+                            scale_root = run['scale_root'] if run['scale_root'] else ''
                             f.write(
                                 f"{i},{run['start_time']:.3f},{run['end_time']:.3f},"
                                 f"{run['duration']:.3f},{run['note_count']},"
+                                f"{run['scale']},{scale_root},{run['scale_confidence']:.2f},"
                                 f"{run['first_note']},{run['last_note']},\"{note_sequence}\"\n"
                             )
                     else:
                         # Human-readable format
-                        f.write('Detected Vocal Runs and Riffs\n')
+                        f.write('Detected Vocal Runs and Riffs with Scale Analysis\n')
                         f.write('=' * 70 + '\n\n')
                         for i, run in enumerate(self.runs_data, 1):
+                            scale_text = f"{run['scale_root']} {run['scale']}" if run['scale_root'] else run['scale']
+                            confidence_pct = int(run['scale_confidence'] * 100)
+
                             f.write(f"Run {i}:\n")
                             f.write(f"  Time: {run['start_time']:.3f}s - {run['end_time']:.3f}s "
                                   f"(duration: {run['duration']:.3f}s)\n")
                             f.write(f"  Note Count: {run['note_count']} notes\n")
+                            f.write(f"  Scale: {scale_text} ({confidence_pct}% confidence)\n")
                             f.write(f"  Range: {run['first_note']} → {run['last_note']}\n")
                             f.write(f"  Average Note Duration: {run['avg_note_duration']:.3f}s\n")
                             f.write(f"  Note Sequence: {' → '.join(run['note_names'])}\n")
@@ -1526,10 +1621,15 @@ class VocalCoachApp(QMainWindow):
             if run['note_count'] > 8:
                 note_sequence += '...'
 
+            # Add scale information
+            scale_text = f"{run['scale_root']} {run['scale']}" if run['scale_root'] else run['scale']
+            confidence_pct = int(run['scale_confidence'] * 100)
+
             item_text = (
                 f"Run {i+1}: {run['note_count']} notes ({run['duration']:.2f}s) "
-                f"@ {run['start_time']:.1f}s | {run['first_note']} → {run['last_note']} | "
-                f"{note_sequence}"
+                f"@ {run['start_time']:.1f}s | "
+                f"🎵 {scale_text} ({confidence_pct}%) | "
+                f"{run['first_note']} → {run['last_note']}"
             )
 
             item = QListWidgetItem(item_text)
