@@ -108,6 +108,7 @@ class AudioPlayer(QThread):
     """Background thread for audio playback"""
     position_changed = pyqtSignal(float)
     finished = pyqtSignal()
+    error_occurred = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -116,6 +117,7 @@ class AudioPlayer(QThread):
         self.is_playing = False
         self.current_position = 0
         self.stop_flag = False
+        self.stream = None
 
     def load_audio(self, audio, sr):
         self.audio = audio
@@ -123,7 +125,7 @@ class AudioPlayer(QThread):
         self.current_position = 0
 
     def run(self):
-        """Play audio using soundfile"""
+        """Play audio using sounddevice"""
         try:
             import sounddevice as sd
 
@@ -132,25 +134,50 @@ class AudioPlayer(QThread):
 
             # Start from current position
             start_sample = int(self.current_position * self.sr)
+            audio_chunk = self.audio[start_sample:]
 
-            # Play audio
-            sd.play(self.audio[start_sample:], self.sr)
+            # Reset stop flag
+            self.stop_flag = False
 
+            # Create a callback for position updates
+            def callback(outdata, frames, time_info, status):
+                if status:
+                    print(f"Playback status: {status}")
+
+            # Play audio with blocking=False
+            sd.play(audio_chunk, self.sr, blocking=False)
+
+            start_time = 0
             # Update position while playing
-            while sd.get_stream().active and not self.stop_flag:
-                current_sample = start_sample + sd.get_stream().time * self.sr
-                self.current_position = current_sample / self.sr
+            while not self.stop_flag:
+                # Check if still playing
+                if not sd.get_stream().active:
+                    break
+
+                # Calculate current position
+                elapsed = sd.get_stream().time
+                self.current_position = start_sample / self.sr + elapsed
                 self.position_changed.emit(self.current_position)
                 self.msleep(50)
 
+            # Wait for playback to finish if not stopped
             if not self.stop_flag:
+                sd.wait()
                 self.finished.emit()
-        except ImportError:
-            print("sounddevice not available, playback disabled")
+            else:
+                sd.stop()
+
+        except ImportError as e:
+            error_msg = "Audio playback not available. Please install sounddevice:\npip install sounddevice"
+            print(error_msg)
+            self.error_occurred.emit(error_msg)
         except Exception as e:
-            print(f"Playback error: {e}")
+            error_msg = f"Playback error: {str(e)}\n\nTry installing PortAudio or reinstalling sounddevice."
+            print(error_msg)
+            self.error_occurred.emit(error_msg)
 
     def stop(self):
+        """Stop audio playback"""
         self.stop_flag = True
         try:
             import sounddevice as sd
@@ -268,6 +295,7 @@ class VocalCoachApp(QMainWindow):
         # Connect player signals
         self.audio_player.position_changed.connect(self.on_position_changed)
         self.audio_player.finished.connect(self.on_playback_finished)
+        self.audio_player.error_occurred.connect(self.on_playback_error)
 
         self.init_ui()
 
@@ -468,6 +496,25 @@ class VocalCoachApp(QMainWindow):
         self.play_btn.setText('▶ Play')
         self.stop_btn.setEnabled(False)
         self.audio_player.current_position = 0
+
+    def on_playback_error(self, error_msg):
+        """Handle playback errors"""
+        from PyQt5.QtWidgets import QMessageBox
+
+        self.is_playing = False
+        self.play_btn.setText('▶ Play')
+        self.stop_btn.setEnabled(False)
+
+        # Show error dialog
+        msg_box = QMessageBox(self)
+        msg_box.setIcon(QMessageBox.Warning)
+        msg_box.setWindowTitle('Audio Playback Error')
+        msg_box.setText('Unable to play audio')
+        msg_box.setInformativeText(error_msg)
+        msg_box.setStandardButtons(QMessageBox.Ok)
+        msg_box.exec_()
+
+        self.statusBar().showMessage('Audio playback error - see details in dialog')
 
     def on_slider_pressed(self):
         """Handle slider press"""
