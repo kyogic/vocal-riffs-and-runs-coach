@@ -11,7 +11,9 @@ import librosa
 import soundfile as sf
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QSlider,
-                             QFileDialog, QProgressBar, QComboBox, QSpinBox)
+                             QFileDialog, QProgressBar, QComboBox, QSpinBox,
+                             QLineEdit, QListWidget, QListWidgetItem, QGroupBox,
+                             QDoubleSpinBox)
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -90,10 +92,13 @@ class PitchAnalysisThread(QThread):
     finished = pyqtSignal(list, object, object, list)  # notes, times, f0, runs
     error = pyqtSignal(str)  # Error message
 
-    def __init__(self, audio, sr):
+    def __init__(self, audio, sr, min_notes=4, max_note_duration=0.4, max_gap=0.2):
         super().__init__()
         self.audio = audio
         self.sr = sr
+        self.min_notes = min_notes
+        self.max_note_duration = max_note_duration
+        self.max_gap = max_gap
 
     def run(self):
         """Analyze pitch in background"""
@@ -104,7 +109,11 @@ class PitchAnalysisThread(QThread):
             notes, times, f0 = pitch_detector.get_note_data(self.audio)
 
             self.progress.emit('Detecting vocal runs...')
-            runs_detector = RunsDetector()
+            runs_detector = RunsDetector(
+                min_notes=self.min_notes,
+                max_note_duration=self.max_note_duration,
+                max_gap=self.max_gap
+            )
             runs = runs_detector.detect_runs(notes)
 
             self.progress.emit(f'Analysis complete! Detected {len(notes)} notes and {len(runs)} runs')
@@ -646,6 +655,48 @@ class VocalCoachApp(QMainWindow):
 
         layout.addLayout(controls_layout)
 
+        # Run detection settings
+        settings_group = QGroupBox('Vocal Run Detection Settings')
+        settings_layout = QHBoxLayout()
+
+        # Min notes
+        settings_layout.addWidget(QLabel('Min Notes:'))
+        self.min_notes_spin = QSpinBox()
+        self.min_notes_spin.setRange(2, 20)
+        self.min_notes_spin.setValue(4)
+        self.min_notes_spin.setToolTip('Minimum consecutive notes to qualify as a run')
+        settings_layout.addWidget(self.min_notes_spin)
+
+        # Max note duration
+        settings_layout.addWidget(QLabel('Max Note Duration (s):'))
+        self.max_duration_spin = QDoubleSpinBox()
+        self.max_duration_spin.setRange(0.1, 2.0)
+        self.max_duration_spin.setValue(0.4)
+        self.max_duration_spin.setSingleStep(0.1)
+        self.max_duration_spin.setDecimals(1)
+        self.max_duration_spin.setToolTip('Maximum duration per note in a run (shorter = faster runs)')
+        settings_layout.addWidget(self.max_duration_spin)
+
+        # Max gap
+        settings_layout.addWidget(QLabel('Max Gap (s):'))
+        self.max_gap_spin = QDoubleSpinBox()
+        self.max_gap_spin.setRange(0.0, 1.0)
+        self.max_gap_spin.setValue(0.2)
+        self.max_gap_spin.setSingleStep(0.1)
+        self.max_gap_spin.setDecimals(1)
+        self.max_gap_spin.setToolTip('Maximum time gap between notes in a run')
+        settings_layout.addWidget(self.max_gap_spin)
+
+        # Re-analyze button
+        self.reanalyze_btn = QPushButton('🔄 Re-analyze with New Settings')
+        self.reanalyze_btn.clicked.connect(self.reanalyze_runs)
+        self.reanalyze_btn.setEnabled(False)
+        settings_layout.addWidget(self.reanalyze_btn)
+
+        settings_layout.addStretch()
+        settings_group.setLayout(settings_layout)
+        layout.addWidget(settings_group)
+
         # Runs navigation controls
         runs_layout = QHBoxLayout()
         runs_layout.addStretch()
@@ -673,6 +724,18 @@ class VocalCoachApp(QMainWindow):
         runs_layout.addStretch()
 
         layout.addLayout(runs_layout)
+
+        # Runs list panel
+        runs_list_group = QGroupBox('Detected Runs')
+        runs_list_layout = QVBoxLayout()
+
+        self.runs_list = QListWidget()
+        self.runs_list.setMaximumHeight(150)
+        self.runs_list.itemClicked.connect(self.on_run_list_item_clicked)
+        runs_list_layout.addWidget(self.runs_list)
+
+        runs_list_group.setLayout(runs_list_layout)
+        layout.addWidget(runs_list_group)
 
         # Status bar
         self.statusBar().showMessage('Ready')
@@ -816,8 +879,15 @@ class VocalCoachApp(QMainWindow):
         self.analyze_btn.setEnabled(False)
         self.statusBar().showMessage('Starting pitch analysis...')
 
+        # Get parameters from UI
+        min_notes = self.min_notes_spin.value()
+        max_duration = self.max_duration_spin.value()
+        max_gap = self.max_gap_spin.value()
+
         # Create and start analysis thread
-        self.analysis_thread = PitchAnalysisThread(self.audio, self.sr)
+        self.analysis_thread = PitchAnalysisThread(
+            self.audio, self.sr, min_notes, max_duration, max_gap
+        )
         self.analysis_thread.progress.connect(self.on_analysis_progress)
         self.analysis_thread.finished.connect(self.on_analysis_finished)
         self.analysis_thread.error.connect(self.on_analysis_error)
@@ -830,14 +900,22 @@ class VocalCoachApp(QMainWindow):
     def on_analysis_finished(self, notes, times, f0, runs):
         """Handle completed analysis"""
         self.analyze_btn.setEnabled(True)
+        self.reanalyze_btn.setEnabled(True)
 
         # Store notes and runs data
         self.notes_data = notes
         self.runs_data = runs
         self.current_run_index = 0
 
+        # Store times and f0 for reanalysis
+        self.times = times
+        self.f0 = f0
+
         # Update visualization
         self.viz_widget.update_data(self.audio, self.sr, times, f0, notes, runs)
+
+        # Populate runs list
+        self.populate_runs_list()
 
         # Enable export and run navigation
         self.export_btn.setEnabled(True)
@@ -846,6 +924,11 @@ class VocalCoachApp(QMainWindow):
             self.next_run_btn.setEnabled(True)
             self.export_runs_btn.setEnabled(True)
             self.runs_label.setText(f'Run 1 of {len(runs)}')
+        else:
+            self.prev_run_btn.setEnabled(False)
+            self.next_run_btn.setEnabled(False)
+            self.export_runs_btn.setEnabled(False)
+            self.runs_label.setText('No runs detected')
 
         status_msg = f'Analysis complete! Detected {len(notes)} notes'
         if runs:
@@ -1099,6 +1182,88 @@ class VocalCoachApp(QMainWindow):
             except Exception as e:
                 self.statusBar().showMessage(f'Error exporting runs: {str(e)}')
                 print(f"Error exporting runs: {e}")
+
+    def populate_runs_list(self):
+        """Populate the runs list widget with detected runs"""
+        self.runs_list.clear()
+
+        if not self.runs_data:
+            item = QListWidgetItem('No runs detected')
+            item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
+            self.runs_list.addItem(item)
+            return
+
+        for i, run in enumerate(self.runs_data):
+            # Format: "Run 1: 8 notes (1.2s) | C4 → D4 → E4 → F4 → G4 → F4 → E4 → D4"
+            note_sequence = ' → '.join(run['note_names'][:8])  # Show first 8 notes
+            if run['note_count'] > 8:
+                note_sequence += '...'
+
+            item_text = (
+                f"Run {i+1}: {run['note_count']} notes ({run['duration']:.2f}s) "
+                f"@ {run['start_time']:.1f}s | {run['first_note']} → {run['last_note']} | "
+                f"{note_sequence}"
+            )
+
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, i)  # Store run index
+            self.runs_list.addItem(item)
+
+    def on_run_list_item_clicked(self, item):
+        """Handle clicking on a run in the list"""
+        run_index = item.data(Qt.UserRole)
+        if run_index is not None:
+            self.current_run_index = run_index
+            self._jump_to_current_run()
+
+            # Highlight the selected item
+            self.runs_list.setCurrentItem(item)
+
+    def reanalyze_runs(self):
+        """Re-analyze runs with new detection parameters"""
+        if not self.notes_data:
+            self.statusBar().showMessage('Please analyze the audio first.')
+            return
+
+        self.statusBar().showMessage('Re-analyzing runs with new settings...')
+
+        # Get new parameters
+        min_notes = self.min_notes_spin.value()
+        max_duration = self.max_duration_spin.value()
+        max_gap = self.max_gap_spin.value()
+
+        # Re-detect runs with new parameters
+        runs_detector = RunsDetector(
+            min_notes=min_notes,
+            max_note_duration=max_duration,
+            max_gap=max_gap
+        )
+        runs = runs_detector.detect_runs(self.notes_data)
+
+        # Update runs data
+        self.runs_data = runs
+        self.current_run_index = 0
+
+        # Update visualization with new runs
+        self.viz_widget.update_data(self.audio, self.sr, self.times, self.f0, self.notes_data, runs)
+
+        # Populate runs list
+        self.populate_runs_list()
+
+        # Update UI
+        if runs:
+            self.prev_run_btn.setEnabled(True)
+            self.next_run_btn.setEnabled(True)
+            self.export_runs_btn.setEnabled(True)
+            self.runs_label.setText(f'Run 1 of {len(runs)}')
+        else:
+            self.prev_run_btn.setEnabled(False)
+            self.next_run_btn.setEnabled(False)
+            self.export_runs_btn.setEnabled(False)
+            self.runs_label.setText('No runs detected')
+
+        status_msg = f'Re-analysis complete! Detected {len(runs)} runs'
+        self.statusBar().showMessage(status_msg, 3000)
 
 
 def main():
