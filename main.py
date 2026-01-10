@@ -806,7 +806,7 @@ class VocalCoachApp(QMainWindow):
 
         if file_path:
             try:
-                with open(file_path, 'w') as f:
+                with open(file_path, 'w', encoding='utf-8') as f:
                     if file_path.endswith('.csv'):
                         # CSV format
                         f.write('Time (s),Note,Frequency (Hz),Duration (s)\n')
