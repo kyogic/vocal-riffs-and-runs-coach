@@ -6,12 +6,13 @@ A desktop application for vocal pitch detection and analysis
 
 import sys
 import os
+import time
 import numpy as np
 import librosa
-import soundfile as sf
+from scipy.ndimage import median_filter
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QSlider,
-                             QFileDialog, QProgressBar, QComboBox, QSpinBox,
+                             QFileDialog, QProgressBar, QSpinBox,
                              QLineEdit, QListWidget, QListWidgetItem, QGroupBox,
                              QDoubleSpinBox, QMessageBox)
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
@@ -19,7 +20,6 @@ from PyQt5.QtGui import QFont
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
-import time
 
 
 class YouTubeDownloader(QThread):
@@ -104,10 +104,12 @@ class PitchAnalysisThread(QThread):
     def run(self):
         """Analyze pitch in background"""
         try:
-            self.progress.emit('Analyzing pitch...')
+            self.progress.emit('Isolating vocals from background music...')
 
             pitch_detector = PitchDetector(self.sr)
-            notes, times, f0 = pitch_detector.get_note_data(self.audio)
+
+            self.progress.emit('Analyzing pitch from isolated vocals...')
+            notes, times, f0 = pitch_detector.get_note_data(self.audio, isolate_vocals=True)
 
             self.progress.emit('Detecting vocal runs...')
             runs_detector = RunsDetector(
@@ -132,6 +134,39 @@ class PitchDetector:
         self.hop_length = 256  # Reduced for better time resolution
         self.fmin = librosa.note_to_hz('C2')  # Lowest vocal note
         self.fmax = librosa.note_to_hz('C7')  # Highest vocal note
+
+    def isolate_vocals(self, audio):
+        """
+        Isolate vocals from background music using harmonic-percussive separation
+        and spectral processing
+        """
+        # Use harmonic-percussive source separation
+        # Vocals are primarily harmonic
+        harmonic, percussive = librosa.effects.hpss(audio, margin=3.0)
+
+        # Further enhance vocals by removing very low frequencies (bass/drums)
+        # and very high frequencies (cymbals/hi-hats)
+        S = librosa.stft(harmonic)
+
+        # Get frequency bins
+        freqs = librosa.fft_frequencies(sr=self.sr)
+
+        # Create a mask: keep frequencies in vocal range (80 Hz to 2000 Hz for fundamentals)
+        # This removes bass (<80Hz) and keeps the vocal range
+        freq_mask = (freqs >= 80) & (freqs <= 2000)
+
+        # Apply mask to spectrogram
+        S_filtered = S.copy()
+        S_filtered[~freq_mask, :] = S_filtered[~freq_mask, :] * 0.1  # Reduce non-vocal frequencies
+
+        # Convert back to audio
+        vocals_isolated = librosa.istft(S_filtered)
+
+        # Normalize
+        if np.max(np.abs(vocals_isolated)) > 0:
+            vocals_isolated = vocals_isolated / np.max(np.abs(vocals_isolated))
+
+        return vocals_isolated
 
     def detect_pitch(self, audio):
         """
@@ -159,8 +194,6 @@ class PitchDetector:
 
     def median_filter_pitch(self, f0, window_size=5):
         """Apply median filter to remove pitch tracking errors"""
-        from scipy.ndimage import median_filter
-
         # Create a copy to work with
         filtered_f0 = f0.copy()
 
@@ -179,11 +212,19 @@ class PitchDetector:
 
         return filtered_f0
 
-    def get_note_data(self, audio):
+    def get_note_data(self, audio, isolate_vocals=True):
         """
         Analyze audio and return note data with timing
         Returns list of (time, frequency, note_name, duration)
+
+        Args:
+            audio: Audio signal
+            isolate_vocals: If True, isolate vocals before pitch detection
         """
+        # Isolate vocals if requested
+        if isolate_vocals:
+            audio = self.isolate_vocals(audio)
+
         f0, voiced_flag, voiced_probs = self.detect_pitch(audio)
 
         # Apply median filter to smooth out pitch tracking errors
@@ -1199,7 +1240,7 @@ class VocalCoachApp(QMainWindow):
         # Enable export and run navigation
         self.export_btn.setEnabled(True)
 
-        # Enable MIDI playback for all notes (always available after analysis)
+        # Enable note playback for all notes (always available after analysis)
         if notes:
             self.play_all_notes_btn.setEnabled(True)
 
