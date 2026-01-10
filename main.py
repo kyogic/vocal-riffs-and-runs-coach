@@ -368,6 +368,9 @@ class AudioSynthPlayer(QThread):
 
             self.progress.emit(f"Playing {len(self.notes_to_play)} notes...")
 
+            # Minimum note duration for audibility (in seconds)
+            min_note_duration = 0.2  # 200ms minimum so you can hear the pitch
+
             # Play each note
             for i, note in enumerate(self.notes_to_play):
                 if self.stop_flag:
@@ -379,32 +382,36 @@ class AudioSynthPlayer(QThread):
                     continue  # Skip invalid notes
 
                 # Calculate duration with tempo adjustment
-                duration = note['duration'] / self.tempo_multiplier
+                original_duration = note['duration'] / self.tempo_multiplier
 
-                # Skip very short notes (less than 50ms)
-                if duration < 0.05:
-                    continue
+                # Use minimum duration for audibility, but keep original for gap calculation
+                playback_duration = max(original_duration, min_note_duration)
 
-                # Generate audio for this note
-                note_audio = self.generate_note_audio(frequency, duration, self.sample_rate)
+                # Generate audio for this note with extended duration
+                note_audio = self.generate_note_audio(frequency, playback_duration, self.sample_rate)
 
                 # Skip if no audio generated
                 if len(note_audio) == 0:
                     continue
 
                 # Update progress
-                self.progress.emit(f"Playing note {i+1}/{len(self.notes_to_play)}: {note['note']}")
+                self.progress.emit(f"Playing note {i+1}/{len(self.notes_to_play)}: {note['note']} ({frequency:.1f} Hz)")
 
                 # Play the note with proper buffer settings
-                # Use larger blocksize to prevent crackling
                 sd.play(note_audio, self.sample_rate, blocksize=4096, device=None)
 
                 # Wait for playback to complete
                 sd.wait()
 
-                # Small gap between notes for clarity
+                # Calculate gap to next note (based on original timing)
                 if i < len(self.notes_to_play) - 1 and not self.stop_flag:
-                    time.sleep(0.05)  # 50ms gap between notes
+                    next_note = self.notes_to_play[i + 1]
+                    # Gap is based on original note timing, not extended playback
+                    original_gap = (next_note['time'] - (note['time'] + note['duration'])) / self.tempo_multiplier
+
+                    # Use a small fixed gap if notes overlap or are very close
+                    gap = max(0.05, original_gap)  # At least 50ms gap
+                    time.sleep(gap)
 
             if not self.stop_flag:
                 self.progress.emit("Playback complete!")
