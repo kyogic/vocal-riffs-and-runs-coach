@@ -324,8 +324,9 @@ class AudioPlayer(QThread):
 
             # Configure for smooth playback
             # Larger blocksize reduces stuttering but increases latency
-            sd.default.blocksize = 4096  # Increased from default for smoother playback
+            sd.default.blocksize = 8192  # Increased further for even smoother playback
             sd.default.latency = 'high'  # Prioritize smooth playback over low latency
+            sd.default.device = None  # Use default device
 
             # Start from current position
             start_sample = int(self.current_position * self.sr)
@@ -334,8 +335,9 @@ class AudioPlayer(QThread):
             # Reset stop flag
             self.stop_flag = False
 
-            # Play audio with blocking=False
+            # Play audio with blocking=False and capture the stream
             sd.play(audio_chunk, self.sr, blocking=False)
+            stream = sd.get_stream()  # Get the actual stream object
 
             # Track start time for position calculation
             import time
@@ -344,8 +346,8 @@ class AudioPlayer(QThread):
 
             # Update position while playing (less frequently to reduce overhead)
             while not self.stop_flag:
-                # Check if still playing
-                if not sd.get_stream().active:
+                # Check if still playing using the captured stream
+                if not stream.active:
                     break
 
                 # Calculate current position based on elapsed time
@@ -354,8 +356,8 @@ class AudioPlayer(QThread):
                 self.current_position = initial_position + elapsed_time
                 self.position_changed.emit(self.current_position)
 
-                # Update every 500ms to minimize GUI impact
-                self.msleep(500)
+                # Update every 200ms for smoother visual feedback without overhead
+                self.msleep(200)
 
             # Wait for playback to finish if not stopped
             if not self.stop_flag:
@@ -409,6 +411,10 @@ class VisualizationWidget(FigureCanvas):
         self.position_line1 = None
         self.position_line2 = None
 
+        # Cache backgrounds for blit rendering
+        self.background1 = None
+        self.background2 = None
+
     def update_data(self, audio, sr, times, f0, notes, runs=None):
         """Update visualization with new data"""
         self.audio = audio
@@ -449,8 +455,8 @@ class VisualizationWidget(FigureCanvas):
         self.ax1.set_title(title)
         self.ax1.set_xlim(0, len(self.audio) / self.sr)
 
-        # Plot current position line and store reference
-        self.position_line1 = self.ax1.axvline(x=self.current_time, color='r', linestyle='--', linewidth=2)
+        # Plot current position line and store reference (animated for blit)
+        self.position_line1 = self.ax1.axvline(x=self.current_time, color='r', linestyle='--', linewidth=2, animated=True)
 
         # Plot pitch
         if self.f0 is not None and self.times is not None:
@@ -515,27 +521,59 @@ class VisualizationWidget(FigureCanvas):
         self.ax2.set_xlim(0, len(self.audio) / self.sr if self.audio is not None else 10)
         self.ax2.legend()
 
-        # Plot current position line and store reference
-        self.position_line2 = self.ax2.axvline(x=self.current_time, color='r', linestyle='--', linewidth=2)
+        # Plot current position line and store reference (animated for blit)
+        self.position_line2 = self.ax2.axvline(x=self.current_time, color='r', linestyle='--', linewidth=2, animated=True)
 
+        # Draw the figure first
         self.draw()
 
+        # Cache the backgrounds for blit rendering (do this AFTER draw)
+        # This allows us to restore the background quickly without redrawing everything
+        try:
+            self.background1 = self.figure.canvas.copy_from_bbox(self.ax1.bbox)
+            self.background2 = self.figure.canvas.copy_from_bbox(self.ax2.bbox)
+        except:
+            # If caching fails, that's ok, we'll fall back to regular draw
+            pass
+
     def update_position(self, time):
-        """Update current playback position - optimized to only move the line"""
+        """Update current playback position - optimized with blit rendering"""
         self.current_time = time
 
         # Only update if we have position lines (after initial plot)
         if self.position_line1 is not None and self.position_line2 is not None:
+            # Try ultra-fast blit rendering first
+            if self.background1 is not None and self.background2 is not None:
+                try:
+                    # Update position lines data
+                    self.position_line1.set_xdata([time, time])
+                    self.position_line2.set_xdata([time, time])
+
+                    # Restore cached backgrounds (fast!)
+                    self.figure.canvas.restore_region(self.background1)
+                    self.figure.canvas.restore_region(self.background2)
+
+                    # Draw only the animated artists (position lines)
+                    self.ax1.draw_artist(self.position_line1)
+                    self.ax2.draw_artist(self.position_line2)
+
+                    # Blit only the changed regions (extremely fast!)
+                    self.figure.canvas.blit(self.ax1.bbox)
+                    self.figure.canvas.blit(self.ax2.bbox)
+
+                    return  # Success! Exit early
+                except:
+                    # Blit failed, fall through to regular draw
+                    pass
+
+            # Fallback: regular update (slower but reliable)
             try:
-                # Update position lines without full redraw
                 self.position_line1.set_xdata([time, time])
                 self.position_line2.set_xdata([time, time])
-
-                # Draw only the updated parts (much faster)
                 self.draw()
             except:
-                # If update fails, do full redraw
-                self.plot()
+                # If even that fails, do nothing (prevents crashes during resize, etc.)
+                pass
         else:
             # Initial plot
             self.plot()
