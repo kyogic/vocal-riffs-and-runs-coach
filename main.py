@@ -19,6 +19,71 @@ from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
 
+class YouTubeDownloader(QThread):
+    """Background thread for downloading YouTube audio"""
+    progress = pyqtSignal(str)  # Progress message
+    finished = pyqtSignal(str)  # Downloaded file path
+    error = pyqtSignal(str)     # Error message
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+        self.output_path = None
+
+    def run(self):
+        """Download audio from YouTube"""
+        try:
+            import yt_dlp
+
+            # Create downloads directory if it doesn't exist
+            download_dir = os.path.join(os.path.expanduser('~'), '.vocal_coach', 'downloads')
+            os.makedirs(download_dir, exist_ok=True)
+
+            # Configure yt-dlp options
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'outtmpl': os.path.join(download_dir, '%(title)s.%(ext)s'),
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'wav',
+                }],
+                'quiet': False,
+                'no_warnings': False,
+                'extract_flat': False,
+            }
+
+            self.progress.emit('Connecting to YouTube...')
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                # Get video info
+                self.progress.emit('Fetching video information...')
+                info = ydl.extract_info(self.url, download=False)
+                title = info.get('title', 'Unknown')
+                duration = info.get('duration', 0)
+
+                self.progress.emit(f'Downloading: {title} ({duration//60}:{duration%60:02d})...')
+
+                # Download and convert
+                ydl.download([self.url])
+
+                # Find the downloaded file
+                output_filename = ydl.prepare_filename(info)
+                # Change extension to wav (due to postprocessor)
+                base_name = os.path.splitext(output_filename)[0]
+                self.output_path = base_name + '.wav'
+
+                if os.path.exists(self.output_path):
+                    self.progress.emit('Download complete!')
+                    self.finished.emit(self.output_path)
+                else:
+                    self.error.emit('Download completed but file not found')
+
+        except ImportError:
+            self.error.emit('yt-dlp not installed. Please run:\npip install yt-dlp')
+        except Exception as e:
+            self.error.emit(f'Download error: {str(e)}')
+
+
 class PitchDetector:
     """Handles pitch detection from audio data"""
 
@@ -132,6 +197,11 @@ class AudioPlayer(QThread):
             if self.audio is None:
                 return
 
+            # Configure for smooth playback
+            # Larger blocksize reduces stuttering but increases latency
+            sd.default.blocksize = 4096  # Increased from default for smoother playback
+            sd.default.latency = 'high'  # Prioritize smooth playback over low latency
+
             # Start from current position
             start_sample = int(self.current_position * self.sr)
             audio_chunk = self.audio[start_sample:]
@@ -139,26 +209,28 @@ class AudioPlayer(QThread):
             # Reset stop flag
             self.stop_flag = False
 
-            # Create a callback for position updates
-            def callback(outdata, frames, time_info, status):
-                if status:
-                    print(f"Playback status: {status}")
-
             # Play audio with blocking=False
             sd.play(audio_chunk, self.sr, blocking=False)
 
-            start_time = 0
-            # Update position while playing
+            # Track start time for position calculation
+            import time
+            playback_start_time = time.time()
+            initial_position = start_sample / self.sr
+
+            # Update position while playing (less frequently to reduce overhead)
             while not self.stop_flag:
                 # Check if still playing
                 if not sd.get_stream().active:
                     break
 
-                # Calculate current position
-                elapsed = sd.get_stream().time
-                self.current_position = start_sample / self.sr + elapsed
+                # Calculate current position based on elapsed time
+                # This is more reliable than querying the stream
+                elapsed_time = time.time() - playback_start_time
+                self.current_position = initial_position + elapsed_time
                 self.position_changed.emit(self.current_position)
-                self.msleep(50)
+
+                # Update every 100ms instead of 50ms to reduce GUI load
+                self.msleep(100)
 
             # Wait for playback to finish if not stopped
             if not self.stop_flag:
@@ -320,13 +392,31 @@ class VocalCoachApp(QMainWindow):
 
         # File controls
         file_layout = QHBoxLayout()
-        self.load_btn = QPushButton('Load Audio File')
+        self.load_btn = QPushButton('📁 Load Audio File')
         self.load_btn.clicked.connect(self.load_audio_file)
         self.file_label = QLabel('No file loaded')
         file_layout.addWidget(self.load_btn)
         file_layout.addWidget(self.file_label)
         file_layout.addStretch()
         layout.addLayout(file_layout)
+
+        # YouTube controls
+        from PyQt5.QtWidgets import QLineEdit
+        youtube_layout = QHBoxLayout()
+        youtube_label = QLabel('Or YouTube URL:')
+        self.youtube_input = QLineEdit()
+        self.youtube_input.setPlaceholderText('https://www.youtube.com/watch?v=...')
+        self.youtube_btn = QPushButton('🎵 Download from YouTube')
+        self.youtube_btn.clicked.connect(self.download_from_youtube)
+        youtube_layout.addWidget(youtube_label)
+        youtube_layout.addWidget(self.youtube_input)
+        youtube_layout.addWidget(self.youtube_btn)
+        layout.addLayout(youtube_layout)
+
+        # Download progress label
+        self.download_label = QLabel('')
+        self.download_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.download_label)
 
         # Visualization
         self.viz_widget = VisualizationWidget(self)
@@ -414,6 +504,97 @@ class VocalCoachApp(QMainWindow):
             except Exception as e:
                 self.statusBar().showMessage(f'Error loading file: {str(e)}')
                 print(f"Error loading audio: {e}")
+
+    def download_from_youtube(self):
+        """Download audio from YouTube URL"""
+        url = self.youtube_input.text().strip()
+
+        if not url:
+            self.statusBar().showMessage('Please enter a YouTube URL')
+            return
+
+        # Basic URL validation
+        if 'youtube.com' not in url and 'youtu.be' not in url:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(self, 'Invalid URL', 'Please enter a valid YouTube URL')
+            return
+
+        # Disable button during download
+        self.youtube_btn.setEnabled(False)
+        self.download_label.setText('Preparing download...')
+
+        # Create and start downloader
+        self.youtube_downloader = YouTubeDownloader(url)
+        self.youtube_downloader.progress.connect(self.on_download_progress)
+        self.youtube_downloader.finished.connect(self.on_download_finished)
+        self.youtube_downloader.error.connect(self.on_download_error)
+        self.youtube_downloader.start()
+
+    def on_download_progress(self, message):
+        """Handle download progress updates"""
+        self.download_label.setText(message)
+        self.statusBar().showMessage(message)
+
+    def on_download_finished(self, file_path):
+        """Handle successful download"""
+        self.youtube_btn.setEnabled(True)
+        self.download_label.setText('✅ Download complete!')
+
+        # Load the downloaded audio
+        try:
+            self.statusBar().showMessage(f'Loading downloaded audio...')
+            QApplication.processEvents()
+
+            # Load audio
+            self.audio, self.sr = librosa.load(file_path, sr=None, mono=True)
+            self.duration = len(self.audio) / self.sr
+
+            # Update UI
+            filename = os.path.basename(file_path)
+            self.file_label.setText(f'Loaded from YouTube: {filename}')
+            self.play_btn.setEnabled(True)
+            self.analyze_btn.setEnabled(True)
+            self.progress_bar.setValue(0)
+
+            # Update time label
+            self.update_time_label(0)
+
+            # Load audio into player
+            self.audio_player.load_audio(self.audio, self.sr)
+
+            # Display waveform
+            self.viz_widget.update_data(self.audio, self.sr, None, None, None)
+
+            self.statusBar().showMessage(f'Ready to analyze!', 3000)
+
+            # Clear download label after a few seconds
+            QTimer.singleShot(3000, lambda: self.download_label.setText(''))
+
+        except Exception as e:
+            self.statusBar().showMessage(f'Error loading downloaded file: {str(e)}')
+            self.download_label.setText(f'❌ Error loading file')
+            print(f"Error loading audio: {e}")
+
+    def on_download_error(self, error_msg):
+        """Handle download errors"""
+        from PyQt5.QtWidgets import QMessageBox
+
+        self.youtube_btn.setEnabled(True)
+        self.download_label.setText('❌ Download failed')
+
+        # Show error dialog
+        msg_box = QMessageBox(self)
+        msg_box.setIcon(QMessageBox.Critical)
+        msg_box.setWindowTitle('Download Error')
+        msg_box.setText('Failed to download from YouTube')
+        msg_box.setInformativeText(error_msg)
+        msg_box.setStandardButtons(QMessageBox.Ok)
+        msg_box.exec_()
+
+        self.statusBar().showMessage('Download failed')
+
+        # Clear download label after a few seconds
+        QTimer.singleShot(3000, lambda: self.download_label.setText(''))
 
     def analyze_pitch(self):
         """Analyze pitch from the loaded audio"""
