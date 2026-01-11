@@ -136,38 +136,39 @@ class PitchDetector:
 
     def __init__(self, sr=22050):
         self.sr = sr
-        self.hop_length = 256  # Reduced for better time resolution
-        self.fmin = librosa.note_to_hz('C2')  # Lowest vocal note
-        self.fmax = librosa.note_to_hz('C7')  # Highest vocal note
+        self.hop_length = 256  # Good time resolution for vocal runs
+        # Typical vocal range: E2 (82 Hz) to E6 (1319 Hz)
+        # Using slightly wider range to avoid cutting off edge notes
+        self.fmin = librosa.note_to_hz('D2')  # ~73 Hz - below typical male vocals
+        self.fmax = librosa.note_to_hz('A6')  # ~1760 Hz - above typical female vocals
 
     def isolate_vocals(self, audio):
         """
         Isolate vocals from background music using harmonic-percussive separation
-        and spectral processing
+        and spectral processing (less aggressive to preserve pitch accuracy)
         """
-        # Use harmonic-percussive source separation
+        # Use harmonic-percussive source separation with lower margin for gentler separation
         # Vocals are primarily harmonic
-        harmonic, percussive = librosa.effects.hpss(audio, margin=3.0)
+        harmonic, percussive = librosa.effects.hpss(audio, margin=2.0)
 
-        # Further enhance vocals by removing very low frequencies (bass/drums)
-        # and very high frequencies (cymbals/hi-hats)
+        # Less aggressive frequency filtering to preserve pitch accuracy
         S = librosa.stft(harmonic)
 
         # Get frequency bins
         freqs = librosa.fft_frequencies(sr=self.sr)
 
-        # Create a mask: keep frequencies in vocal range (80 Hz to 2000 Hz for fundamentals)
-        # This removes bass (<80Hz) and keeps the vocal range
-        freq_mask = (freqs >= 80) & (freqs <= 2000)
+        # Create a mask: keep frequencies in vocal range (60 Hz to 4000 Hz)
+        # Wider range to avoid cutting off harmonics that help pitch detection
+        freq_mask = (freqs >= 60) & (freqs <= 4000)
 
-        # Apply mask to spectrogram
+        # Apply mask to spectrogram - keep more of the original to preserve pitch
         S_filtered = S.copy()
-        S_filtered[~freq_mask, :] = S_filtered[~freq_mask, :] * 0.1  # Reduce non-vocal frequencies
+        S_filtered[~freq_mask, :] = S_filtered[~freq_mask, :] * 0.3  # Less aggressive filtering
 
         # Convert back to audio
         vocals_isolated = librosa.istft(S_filtered)
 
-        # Normalize
+        # Normalize carefully
         if np.max(np.abs(vocals_isolated)) > 0:
             vocals_isolated = vocals_isolated / np.max(np.abs(vocals_isolated))
 
@@ -178,13 +179,16 @@ class PitchDetector:
         Detect pitch from audio using librosa's pyin algorithm
         Returns frequencies, voiced flag, and voiced probabilities
         """
+        # pyin parameters optimized for vocal pitch detection
         f0, voiced_flag, voiced_probs = librosa.pyin(
             audio,
             fmin=self.fmin,
             fmax=self.fmax,
             sr=self.sr,
             hop_length=self.hop_length,
-            frame_length=2048  # Larger frame for better frequency resolution
+            frame_length=2048,  # Good frequency resolution
+            win_length=1800,    # Smaller window for better time resolution
+            fill_na=None        # Keep NaN for unvoiced regions (don't interpolate)
         )
         return f0, voiced_flag, voiced_probs
 
@@ -242,17 +246,38 @@ class PitchDetector:
             hop_length=self.hop_length
         )
 
+        # Calculate RMS energy for each frame to filter out silence
+        # This prevents detecting "phantom notes" in quiet/silent sections
+        frame_length = 2048
+        rms = librosa.feature.rms(
+            y=audio,
+            frame_length=frame_length,
+            hop_length=self.hop_length
+        )[0]
+
+        # Pad or trim rms to match f0 length
+        if len(rms) < len(f0_filtered):
+            rms = np.pad(rms, (0, len(f0_filtered) - len(rms)), mode='edge')
+        elif len(rms) > len(f0_filtered):
+            rms = rms[:len(f0_filtered)]
+
+        # Calculate minimum energy threshold as a percentage of max energy
+        # This adapts to the overall loudness of the audio
+        max_energy = np.max(rms)
+        min_energy_threshold = max_energy * 0.15  # Require at least 15% of max energy
+
         notes = []
         current_note = None
         note_start = None
         freq_accumulator = []  # Accumulate frequencies for averaging
 
-        # Minimum voiced probability threshold (0.0 to 1.0)
-        min_voiced_prob = 0.5  # Only use detections with >50% confidence
+        # Increased voiced probability threshold (0.0 to 1.0)
+        min_voiced_prob = 0.75  # Only use detections with >75% confidence (reduced false positives)
 
-        for i, (time, freq, voiced, prob) in enumerate(zip(times, f0_filtered, voiced_flag, voiced_probs)):
-            # Only consider high-confidence voiced segments
-            if voiced and not np.isnan(freq) and prob >= min_voiced_prob:
+        for i, (time, freq, voiced, prob, energy) in enumerate(zip(times, f0_filtered, voiced_flag, voiced_probs, rms)):
+            # Only consider high-confidence voiced segments with sufficient energy
+            # This filters out both uncertain detections AND silence/quiet sections
+            if voiced and not np.isnan(freq) and prob >= min_voiced_prob and energy >= min_energy_threshold:
                 note_name = self.frequency_to_note(freq)
 
                 # Accumulate frequency for averaging
