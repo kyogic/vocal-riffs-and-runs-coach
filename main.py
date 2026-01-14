@@ -91,12 +91,13 @@ class PitchAnalysisThread(QThread):
     """Background thread for pitch analysis"""
     progress = pyqtSignal(str)  # Progress message
     progress_percent = pyqtSignal(int)  # Progress percentage (0-100)
-    finished = pyqtSignal(list, object, object, list)  # notes, times, f0, runs
+    finished = pyqtSignal(list, object, object, list, float)  # notes, times, f0, runs, bpm
     error = pyqtSignal(str)  # Error message
 
     def __init__(self, audio, sr, min_notes=4, max_note_duration=0.4, max_gap=0.2,
                  voiced_threshold=0.75, energy_threshold=0.15, isolate_vocals=True,
-                 start_time=None, end_time=None, algorithm='pyin', min_note_duration=0.05):
+                 start_time=None, end_time=None, algorithm='pyin', min_note_duration=0.05,
+                 detect_bpm=True):
         super().__init__()
         self.audio = audio
         self.sr = sr
@@ -110,6 +111,8 @@ class PitchAnalysisThread(QThread):
         self.end_time = end_time
         self.algorithm = algorithm
         self.min_note_duration = min_note_duration
+        self.detect_bpm = detect_bpm
+        self.bpm = None
 
     def run(self):
         """Analyze pitch in background"""
@@ -150,7 +153,7 @@ class PitchAnalysisThread(QThread):
                 times = times + self.start_time
 
             self.progress.emit('Detecting vocal runs and scales...')
-            self.progress_percent.emit(80)
+            self.progress_percent.emit(70)
             runs_detector = RunsDetector(
                 min_notes=self.min_notes,
                 max_note_duration=self.max_note_duration,
@@ -158,9 +161,23 @@ class PitchAnalysisThread(QThread):
             )
             runs = runs_detector.detect_runs(notes)
 
+            # Detect BPM/tempo
+            bpm = 0.0
+            if self.detect_bpm:
+                try:
+                    self.progress.emit('Detecting tempo (BPM)...')
+                    self.progress_percent.emit(90)
+                    # Use full audio for BPM detection (not just the region)
+                    tempo, _ = librosa.beat.beat_track(y=self.audio, sr=self.sr)
+                    bpm = float(tempo) if np.isscalar(tempo) else float(tempo[0])
+                    self.progress.emit(f'Detected tempo: {bpm:.1f} BPM')
+                except Exception as e:
+                    self.progress.emit(f'Could not detect BPM: {str(e)}')
+                    bpm = 0.0
+
             self.progress.emit(f'Analysis complete! Detected {len(notes)} notes and {len(runs)} runs')
             self.progress_percent.emit(100)
-            self.finished.emit(notes, times, f0, runs)
+            self.finished.emit(notes, times, f0, runs, bpm)
 
         except Exception as e:
             self.error.emit(f'Analysis error: {str(e)}')
@@ -608,6 +625,7 @@ class AudioSynthPlayer(QThread):
     progress = pyqtSignal(str)  # Progress message
     finished = pyqtSignal()
     error = pyqtSignal(str)
+    note_playing = pyqtSignal(str)  # Currently playing note for piano visualization
 
     def __init__(self):
         super().__init__()
@@ -702,8 +720,9 @@ class AudioSynthPlayer(QThread):
                 if len(note_audio) == 0:
                     continue
 
-                # Update progress
+                # Update progress and emit note for piano visualization
                 self.progress.emit(f"Playing note {i+1}/{len(self.notes_to_play)}: {note['note']} ({frequency:.1f} Hz)")
+                self.note_playing.emit(note['note'])  # Signal for piano keyboard
 
                 # Play the note with proper buffer settings
                 sd.play(note_audio, self.sample_rate, blocksize=4096, device=None)
@@ -834,6 +853,102 @@ class AudioPlayer(QThread):
             sd.stop()
         except:
             pass
+
+
+class PianoWidget(FigureCanvas):
+    """Widget for displaying piano keyboard with note visualization"""
+
+    def __init__(self, parent=None):
+        self.figure = Figure(figsize=(12, 2))
+        super().__init__(self.figure)
+        self.setParent(parent)
+
+        self.ax = self.figure.add_subplot(111)
+        self.figure.tight_layout()
+
+        # Piano configuration
+        self.octave_range = (2, 6)  # C2 to C6
+        self.active_notes = set()  # Currently playing notes
+
+        self.draw_piano()
+
+    def draw_piano(self):
+        """Draw the piano keyboard"""
+        self.ax.clear()
+
+        # Note names and colors
+        white_notes = ['C', 'D', 'E', 'F', 'G', 'A', 'B']
+        black_notes = ['C#', 'D#', 'F#', 'G#', 'A#']
+
+        white_key_width = 1
+        black_key_width = 0.6
+        white_key_height = 4
+        black_key_height = 2.5
+
+        x_position = 0
+        key_positions = {}  # Store positions for highlighting
+
+        # Draw keys for each octave
+        for octave in range(self.octave_range[0], self.octave_range[1] + 1):
+            for note in white_notes:
+                note_name = f"{note}{octave}"
+
+                # Determine color (active vs inactive)
+                color = 'yellow' if note_name in self.active_notes else 'white'
+                edge_color = 'red' if note_name in self.active_notes else 'black'
+                linewidth = 2 if note_name in self.active_notes else 1
+
+                # Draw white key
+                rect = plt.Rectangle((x_position, 0), white_key_width, white_key_height,
+                                    facecolor=color, edgecolor=edge_color, linewidth=linewidth)
+                self.ax.add_patch(rect)
+
+                # Add note label
+                if octave == 4:  # Label middle octave only
+                    self.ax.text(x_position + white_key_width/2, 0.3, note,
+                               ha='center', va='bottom', fontsize=8)
+
+                key_positions[note_name] = (x_position + white_key_width/2, white_key_height/2)
+                x_position += white_key_width
+
+        # Draw black keys on top
+        x_position = 0
+        for octave in range(self.octave_range[0], self.octave_range[1] + 1):
+            for i, note in enumerate(white_notes[:-1]):  # Skip last B
+                x_position += white_key_width
+
+                # Check if there's a black key after this white key
+                if note in ['C', 'D', 'F', 'G', 'A']:
+                    black_note = note + '#'
+                    note_name = f"{black_note}{octave}"
+
+                    # Determine color
+                    color = 'yellow' if note_name in self.active_notes else 'black'
+                    edge_color = 'red' if note_name in self.active_notes else 'black'
+                    linewidth = 2 if note_name in self.active_notes else 1
+
+                    # Draw black key (offset to left)
+                    rect = plt.Rectangle((x_position - black_key_width/2, white_key_height - black_key_height),
+                                        black_key_width, black_key_height,
+                                        facecolor=color, edgecolor=edge_color, linewidth=linewidth, zorder=2)
+                    self.ax.add_patch(rect)
+
+                    key_positions[note_name] = (x_position, white_key_height - black_key_height/2)
+
+            x_position += white_key_width  # Last B
+
+        self.ax.set_xlim(-0.5, x_position + 0.5)
+        self.ax.set_ylim(-0.5, white_key_height + 0.5)
+        self.ax.set_aspect('equal')
+        self.ax.axis('off')
+        self.ax.set_title('Piano Keyboard - Notes will light up during playback', fontsize=10)
+
+        self.draw()
+
+    def highlight_notes(self, notes):
+        """Highlight specific notes on the keyboard"""
+        self.active_notes = set(notes)
+        self.draw_piano()
 
 
 class VisualizationWidget(FigureCanvas):
@@ -969,7 +1084,17 @@ class VisualizationWidget(FigureCanvas):
         if self.runs:
             pitch_title += f' (🎵 {len(self.runs)} runs highlighted)'
         self.ax2.set_title(pitch_title)
-        self.ax2.set_xlim(0, len(self.audio) / self.sr if self.audio is not None else 10)
+
+        # Auto-zoom based on data range with padding
+        if self.times is not None and len(self.times) > 0:
+            time_min = np.min(self.times)
+            time_max = np.max(self.times)
+            time_range = time_max - time_min
+            padding = time_range * 0.05 if time_range > 0 else 0.5  # 5% padding or 0.5s minimum
+            self.ax2.set_xlim(max(0, time_min - padding), time_max + padding)
+        else:
+            self.ax2.set_xlim(0, len(self.audio) / self.sr if self.audio is not None else 10)
+
         self.ax2.legend()
 
         # Plot current position line and store reference (animated for blit)
@@ -1046,6 +1171,7 @@ class VocalCoachApp(QMainWindow):
         self.notes_data = []
         self.runs_data = []
         self.current_run_index = 0
+        self.bpm = 0.0  # Detected BPM
 
         # Connect player signals
         self.audio_player.position_changed.connect(self.on_position_changed)
@@ -1056,6 +1182,7 @@ class VocalCoachApp(QMainWindow):
         self.note_player.progress.connect(self.on_note_playback_progress)
         self.note_player.finished.connect(self.on_note_playback_finished)
         self.note_player.error.connect(self.on_note_playback_error)
+        self.note_player.note_playing.connect(self.on_note_playing)
 
         self.init_ui()
 
@@ -1106,6 +1233,10 @@ class VocalCoachApp(QMainWindow):
         self.download_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.download_label)
 
+        # Piano keyboard visualization
+        self.piano_widget = PianoWidget(self)
+        layout.addWidget(self.piano_widget)
+
         # Visualization
         self.viz_widget = VisualizationWidget(self)
         layout.addWidget(self.viz_widget)
@@ -1118,10 +1249,20 @@ class VocalCoachApp(QMainWindow):
         self.progress_bar.sliderReleased.connect(self.on_slider_released)
         layout.addWidget(self.progress_bar)
 
-        # Time label
+        # Time and BPM label
+        time_bpm_layout = QHBoxLayout()
         self.time_label = QLabel('0:00 / 0:00')
         self.time_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.time_label)
+        time_bpm_layout.addStretch()
+        time_bpm_layout.addWidget(self.time_label)
+        time_bpm_layout.addStretch()
+
+        self.bpm_label = QLabel('BPM: --')
+        self.bpm_label.setAlignment(Qt.AlignCenter)
+        self.bpm_label.setFont(QFont('Arial', 10, QFont.Bold))
+        time_bpm_layout.addWidget(self.bpm_label)
+        time_bpm_layout.addStretch()
+        layout.addLayout(time_bpm_layout)
 
         # Playback controls
         controls_layout = QHBoxLayout()
@@ -1580,7 +1721,8 @@ class VocalCoachApp(QMainWindow):
         self.analysis_thread = PitchAnalysisThread(
             self.audio, self.sr, min_notes, max_duration, max_gap,
             voiced_threshold, energy_threshold, isolate_vocals,
-            start_time, end_time, algorithm, min_note_duration
+            start_time, end_time, algorithm, min_note_duration,
+            detect_bpm=True
         )
         self.analysis_thread.progress.connect(self.on_analysis_progress)
         self.analysis_thread.progress_percent.connect(self.on_analysis_progress_percent)
@@ -1597,7 +1739,7 @@ class VocalCoachApp(QMainWindow):
         """Handle analysis progress percentage updates"""
         self.analysis_progress.setValue(percent)
 
-    def on_analysis_finished(self, notes, times, f0, runs):
+    def on_analysis_finished(self, notes, times, f0, runs, bpm):
         """Handle completed analysis"""
         self.analyze_btn.setEnabled(True)
         self.reanalyze_btn.setEnabled(True)
@@ -1609,6 +1751,13 @@ class VocalCoachApp(QMainWindow):
         self.notes_data = notes
         self.runs_data = runs
         self.current_run_index = 0
+        self.bpm = bpm
+
+        # Update BPM display
+        if bpm > 0:
+            self.bpm_label.setText(f'BPM: {bpm:.1f}')
+        else:
+            self.bpm_label.setText('BPM: --')
 
         # Store times and f0 for reanalysis
         self.times = times
@@ -2062,6 +2211,10 @@ class VocalCoachApp(QMainWindow):
         """Handle note playback progress updates"""
         self.note_status_label.setText(message)
 
+    def on_note_playing(self, note_name):
+        """Handle note currently being played - update piano visualization"""
+        self.piano_widget.highlight_notes([note_name])
+
     def on_note_playback_finished(self):
         """Handle note playback finished"""
         self.is_playing_notes = False
@@ -2070,6 +2223,9 @@ class VocalCoachApp(QMainWindow):
             self.play_run_btn.setEnabled(True)
         self.stop_notes_btn.setEnabled(False)
         self.note_status_label.setText('Playback complete')
+
+        # Clear piano keyboard
+        self.piano_widget.highlight_notes([])
 
         # Clear status after a few seconds
         QTimer.singleShot(3000, lambda: self.note_status_label.setText(''))
