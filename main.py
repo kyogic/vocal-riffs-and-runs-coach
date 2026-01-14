@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QSlider,
                              QFileDialog, QProgressBar, QSpinBox,
                              QLineEdit, QListWidget, QListWidgetItem, QGroupBox,
-                             QDoubleSpinBox, QMessageBox, QCheckBox)
+                             QDoubleSpinBox, QMessageBox, QCheckBox, QComboBox)
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -96,7 +96,7 @@ class PitchAnalysisThread(QThread):
 
     def __init__(self, audio, sr, min_notes=4, max_note_duration=0.4, max_gap=0.2,
                  voiced_threshold=0.75, energy_threshold=0.15, isolate_vocals=True,
-                 start_time=None, end_time=None):
+                 start_time=None, end_time=None, algorithm='pyin', min_note_duration=0.05):
         super().__init__()
         self.audio = audio
         self.sr = sr
@@ -108,6 +108,8 @@ class PitchAnalysisThread(QThread):
         self.isolate_vocals = isolate_vocals
         self.start_time = start_time
         self.end_time = end_time
+        self.algorithm = algorithm
+        self.min_note_duration = min_note_duration
 
     def run(self):
         """Analyze pitch in background"""
@@ -129,10 +131,12 @@ class PitchAnalysisThread(QThread):
             pitch_detector = PitchDetector(
                 self.sr,
                 voiced_threshold=self.voiced_threshold,
-                energy_threshold=self.energy_threshold
+                energy_threshold=self.energy_threshold,
+                algorithm=self.algorithm,
+                min_note_duration=self.min_note_duration
             )
 
-            self.progress.emit('Analyzing pitch...')
+            self.progress.emit(f'Analyzing pitch using {self.algorithm.upper()} algorithm...')
             self.progress_percent.emit(40)
             notes, times, f0 = pitch_detector.get_note_data(
                 audio_to_analyze,
@@ -165,7 +169,8 @@ class PitchAnalysisThread(QThread):
 class PitchDetector:
     """Handles pitch detection from audio data"""
 
-    def __init__(self, sr=22050, voiced_threshold=0.75, energy_threshold=0.15):
+    def __init__(self, sr=22050, voiced_threshold=0.75, energy_threshold=0.15,
+                 algorithm='pyin', min_note_duration=0.05):
         self.sr = sr
         self.hop_length = 256  # Good time resolution for vocal runs
         # Typical vocal range: E2 (82 Hz) to E6 (1319 Hz)
@@ -174,6 +179,8 @@ class PitchDetector:
         self.fmax = librosa.note_to_hz('A6')  # ~1760 Hz - above typical female vocals
         self.voiced_threshold = voiced_threshold
         self.energy_threshold = energy_threshold
+        self.algorithm = algorithm
+        self.min_note_duration = min_note_duration
 
     def isolate_vocals(self, audio):
         """
@@ -209,20 +216,54 @@ class PitchDetector:
 
     def detect_pitch(self, audio):
         """
-        Detect pitch from audio using librosa's pyin algorithm
+        Detect pitch from audio using selected algorithm
         Returns frequencies, voiced flag, and voiced probabilities
         """
-        # pyin parameters optimized for vocal pitch detection
-        f0, voiced_flag, voiced_probs = librosa.pyin(
-            audio,
-            fmin=self.fmin,
-            fmax=self.fmax,
-            sr=self.sr,
-            hop_length=self.hop_length,
-            frame_length=2048,  # Good frequency resolution
-            win_length=1800,    # Smaller window for better time resolution
-            fill_na=None        # Keep NaN for unvoiced regions (don't interpolate)
-        )
+        if self.algorithm == 'yin':
+            # YIN algorithm - simpler, sometimes more reliable for clean vocals
+            # YIN doesn't return voiced_flag or voiced_probs, so we'll estimate them
+            f0 = librosa.yin(
+                audio,
+                fmin=self.fmin,
+                fmax=self.fmax,
+                sr=self.sr,
+                hop_length=self.hop_length,
+                frame_length=2048
+            )
+            # Estimate voiced flag (any non-NaN frequency is considered voiced)
+            voiced_flag = ~np.isnan(f0)
+            # For YIN, we'll create a simple confidence based on frequency stability
+            voiced_probs = np.ones_like(f0)
+            voiced_probs[np.isnan(f0)] = 0.0
+
+            # Calculate confidence based on local stability
+            for i in range(1, len(f0) - 1):
+                if not np.isnan(f0[i]):
+                    # Look at neighboring frames
+                    neighbors = []
+                    if not np.isnan(f0[i-1]):
+                        neighbors.append(abs(f0[i] - f0[i-1]) / f0[i])
+                    if i < len(f0) - 1 and not np.isnan(f0[i+1]):
+                        neighbors.append(abs(f0[i] - f0[i+1]) / f0[i])
+
+                    if neighbors:
+                        # Stability = inverse of relative variation
+                        variation = np.mean(neighbors)
+                        voiced_probs[i] = max(0.0, 1.0 - variation * 10)
+
+        else:  # pyin (default)
+            # pYIN algorithm - probabilistic YIN with better handling of noise
+            f0, voiced_flag, voiced_probs = librosa.pyin(
+                audio,
+                fmin=self.fmin,
+                fmax=self.fmax,
+                sr=self.sr,
+                hop_length=self.hop_length,
+                frame_length=2048,  # Good frequency resolution
+                win_length=1800,    # Smaller window for better time resolution
+                fill_na=None        # Keep NaN for unvoiced regions (don't interpolate)
+            )
+
         return f0, voiced_flag, voiced_probs
 
     def frequency_to_note(self, frequency):
@@ -323,8 +364,8 @@ class PitchDetector:
                         # Use median frequency for robustness
                         avg_freq = np.median(freq_accumulator[:-1]) if len(freq_accumulator) > 1 else freq_accumulator[0]
 
-                        # Only save notes with minimum duration (reduces noise)
-                        if duration >= 0.02:  # At least 20ms
+                        # Only save notes with minimum duration (configurable, reduces noise)
+                        if duration >= self.min_note_duration:
                             notes.append({
                                 'time': note_start,
                                 'frequency': avg_freq,
@@ -343,8 +384,8 @@ class PitchDetector:
                     # Use median frequency for robustness
                     avg_freq = np.median(freq_accumulator)
 
-                    # Only save notes with minimum duration
-                    if duration >= 0.02:  # At least 20ms
+                    # Only save notes with minimum duration (configurable)
+                    if duration >= self.min_note_duration:
                         notes.append({
                             'time': note_start,
                             'frequency': avg_freq,
@@ -354,6 +395,18 @@ class PitchDetector:
                     current_note = None
                     note_start = None
                     freq_accumulator = []
+
+        # Don't forget to save the last note if it exists
+        if current_note is not None and note_start is not None and len(freq_accumulator) > 0:
+            duration = times[-1] - note_start
+            avg_freq = np.median(freq_accumulator)
+            if duration >= self.min_note_duration:
+                notes.append({
+                    'time': note_start,
+                    'frequency': avg_freq,
+                    'note': current_note,
+                    'duration': duration
+                })
 
         return notes, times, f0
 
@@ -1112,8 +1165,16 @@ class VocalCoachApp(QMainWindow):
         pitch_settings_group = QGroupBox('Pitch Detection Settings')
         pitch_settings_layout = QVBoxLayout()
 
-        # First row: Thresholds
+        # First row: Algorithm and basic settings
         pitch_row1 = QHBoxLayout()
+
+        # Algorithm selection
+        pitch_row1.addWidget(QLabel('Algorithm:'))
+        self.algorithm_combo = QComboBox()
+        self.algorithm_combo.addItem('pYIN (Probabilistic)', 'pyin')
+        self.algorithm_combo.addItem('YIN (Simple)', 'yin')
+        self.algorithm_combo.setToolTip('Pitch detection algorithm\npYIN: Better for noisy audio, more robust\nYIN: Simpler, sometimes more accurate for clean vocals')
+        pitch_row1.addWidget(self.algorithm_combo)
 
         # Voiced confidence threshold
         pitch_row1.addWidget(QLabel('Voice Confidence:'))
@@ -1122,7 +1183,6 @@ class VocalCoachApp(QMainWindow):
         self.voiced_confidence_spin.setValue(0.75)
         self.voiced_confidence_spin.setSingleStep(0.05)
         self.voiced_confidence_spin.setDecimals(2)
-        self.voiced_confidence_spin.setSuffix('%')
         self.voiced_confidence_spin.setToolTip('Minimum confidence to detect a note (0.0-1.0)\nHigher = fewer false positives, may miss quiet notes\nLower = more sensitive, may detect noise')
         pitch_row1.addWidget(self.voiced_confidence_spin)
 
@@ -1136,9 +1196,19 @@ class VocalCoachApp(QMainWindow):
         self.energy_threshold_spin.setToolTip('Minimum audio energy to detect notes (0.0-0.5)\nHigher = ignores quiet sections\nLower = more sensitive to soft vocals')
         pitch_row1.addWidget(self.energy_threshold_spin)
 
+        # Min note duration
+        pitch_row1.addWidget(QLabel('Min Note (ms):'))
+        self.min_note_duration_spin = QSpinBox()
+        self.min_note_duration_spin.setRange(20, 500)
+        self.min_note_duration_spin.setValue(50)
+        self.min_note_duration_spin.setSingleStep(10)
+        self.min_note_duration_spin.setSuffix('ms')
+        self.min_note_duration_spin.setToolTip('Minimum note duration in milliseconds\nHigher = filters out very short detections (noise)\nLower = captures faster runs')
+        pitch_row1.addWidget(self.min_note_duration_spin)
+
         # Vocal isolation toggle
         self.isolate_vocals_checkbox = QCheckBox('Isolate Vocals')
-        self.isolate_vocals_checkbox.setChecked(True)
+        self.isolate_vocals_checkbox.setChecked(False)  # Default OFF for a cappella
         self.isolate_vocals_checkbox.setToolTip('Apply vocal isolation before pitch detection\nUse for songs with background music\nDisable for a cappella tracks')
         pitch_row1.addWidget(self.isolate_vocals_checkbox)
 
@@ -1492,6 +1562,8 @@ class VocalCoachApp(QMainWindow):
         voiced_threshold = self.voiced_confidence_spin.value()
         energy_threshold = self.energy_threshold_spin.value()
         isolate_vocals = self.isolate_vocals_checkbox.isChecked()
+        algorithm = self.algorithm_combo.currentData()
+        min_note_duration = self.min_note_duration_spin.value() / 1000.0  # Convert ms to seconds
 
         # Get region selection
         start_time = self.start_time_spin.value() if self.start_time_spin.value() > 0 else None
@@ -1508,7 +1580,7 @@ class VocalCoachApp(QMainWindow):
         self.analysis_thread = PitchAnalysisThread(
             self.audio, self.sr, min_notes, max_duration, max_gap,
             voiced_threshold, energy_threshold, isolate_vocals,
-            start_time, end_time
+            start_time, end_time, algorithm, min_note_duration
         )
         self.analysis_thread.progress.connect(self.on_analysis_progress)
         self.analysis_thread.progress_percent.connect(self.on_analysis_progress_percent)
