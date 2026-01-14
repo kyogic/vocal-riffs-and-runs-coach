@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QSlider,
                              QFileDialog, QProgressBar, QSpinBox,
                              QLineEdit, QListWidget, QListWidgetItem, QGroupBox,
-                             QDoubleSpinBox, QMessageBox)
+                             QDoubleSpinBox, QMessageBox, QCheckBox)
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -94,25 +94,56 @@ class PitchAnalysisThread(QThread):
     finished = pyqtSignal(list, object, object, list)  # notes, times, f0, runs
     error = pyqtSignal(str)  # Error message
 
-    def __init__(self, audio, sr, min_notes=4, max_note_duration=0.4, max_gap=0.2):
+    def __init__(self, audio, sr, min_notes=4, max_note_duration=0.4, max_gap=0.2,
+                 voiced_threshold=0.75, energy_threshold=0.15, isolate_vocals=True,
+                 start_time=None, end_time=None):
         super().__init__()
         self.audio = audio
         self.sr = sr
         self.min_notes = min_notes
         self.max_note_duration = max_note_duration
         self.max_gap = max_gap
+        self.voiced_threshold = voiced_threshold
+        self.energy_threshold = energy_threshold
+        self.isolate_vocals = isolate_vocals
+        self.start_time = start_time
+        self.end_time = end_time
 
     def run(self):
         """Analyze pitch in background"""
         try:
-            self.progress.emit('Isolating vocals from background music...')
+            # Extract region if specified
+            audio_to_analyze = self.audio
+            if self.start_time is not None or self.end_time is not None:
+                start_sample = int(self.start_time * self.sr) if self.start_time else 0
+                end_sample = int(self.end_time * self.sr) if self.end_time else len(self.audio)
+                audio_to_analyze = self.audio[start_sample:end_sample]
+                self.progress.emit(f'Analyzing region {self.start_time:.1f}s - {self.end_time:.1f}s')
+
+            if self.isolate_vocals:
+                self.progress.emit('Isolating vocals from background music...')
+            else:
+                self.progress.emit('Analyzing audio without vocal isolation...')
             self.progress_percent.emit(10)
 
-            pitch_detector = PitchDetector(self.sr)
+            pitch_detector = PitchDetector(
+                self.sr,
+                voiced_threshold=self.voiced_threshold,
+                energy_threshold=self.energy_threshold
+            )
 
-            self.progress.emit('Analyzing pitch from isolated vocals...')
+            self.progress.emit('Analyzing pitch...')
             self.progress_percent.emit(40)
-            notes, times, f0 = pitch_detector.get_note_data(self.audio, isolate_vocals=True)
+            notes, times, f0 = pitch_detector.get_note_data(
+                audio_to_analyze,
+                isolate_vocals=self.isolate_vocals
+            )
+
+            # Adjust note times if analyzing a region
+            if self.start_time is not None and self.start_time > 0:
+                for note in notes:
+                    note['time'] += self.start_time
+                times = times + self.start_time
 
             self.progress.emit('Detecting vocal runs and scales...')
             self.progress_percent.emit(80)
@@ -134,13 +165,15 @@ class PitchAnalysisThread(QThread):
 class PitchDetector:
     """Handles pitch detection from audio data"""
 
-    def __init__(self, sr=22050):
+    def __init__(self, sr=22050, voiced_threshold=0.75, energy_threshold=0.15):
         self.sr = sr
         self.hop_length = 256  # Good time resolution for vocal runs
         # Typical vocal range: E2 (82 Hz) to E6 (1319 Hz)
         # Using slightly wider range to avoid cutting off edge notes
         self.fmin = librosa.note_to_hz('D2')  # ~73 Hz - below typical male vocals
         self.fmax = librosa.note_to_hz('A6')  # ~1760 Hz - above typical female vocals
+        self.voiced_threshold = voiced_threshold
+        self.energy_threshold = energy_threshold
 
     def isolate_vocals(self, audio):
         """
@@ -264,15 +297,15 @@ class PitchDetector:
         # Calculate minimum energy threshold as a percentage of max energy
         # This adapts to the overall loudness of the audio
         max_energy = np.max(rms)
-        min_energy_threshold = max_energy * 0.15  # Require at least 15% of max energy
+        min_energy_threshold = max_energy * self.energy_threshold  # Use configurable threshold
 
         notes = []
         current_note = None
         note_start = None
         freq_accumulator = []  # Accumulate frequencies for averaging
 
-        # Increased voiced probability threshold (0.0 to 1.0)
-        min_voiced_prob = 0.75  # Only use detections with >75% confidence (reduced false positives)
+        # Use configurable voiced probability threshold (0.0 to 1.0)
+        min_voiced_prob = self.voiced_threshold
 
         for i, (time, freq, voiced, prob, energy) in enumerate(zip(times, f0_filtered, voiced_flag, voiced_probs, rms)):
             # Only consider high-confidence voiced segments with sufficient energy
@@ -1075,6 +1108,87 @@ class VocalCoachApp(QMainWindow):
         self.analysis_progress.setVisible(False)  # Hidden until analysis starts
         layout.addWidget(self.analysis_progress)
 
+        # Pitch Detection Settings (new section above run detection)
+        pitch_settings_group = QGroupBox('Pitch Detection Settings')
+        pitch_settings_layout = QVBoxLayout()
+
+        # First row: Thresholds
+        pitch_row1 = QHBoxLayout()
+
+        # Voiced confidence threshold
+        pitch_row1.addWidget(QLabel('Voice Confidence:'))
+        self.voiced_confidence_spin = QDoubleSpinBox()
+        self.voiced_confidence_spin.setRange(0.0, 1.0)
+        self.voiced_confidence_spin.setValue(0.75)
+        self.voiced_confidence_spin.setSingleStep(0.05)
+        self.voiced_confidence_spin.setDecimals(2)
+        self.voiced_confidence_spin.setSuffix('%')
+        self.voiced_confidence_spin.setToolTip('Minimum confidence to detect a note (0.0-1.0)\nHigher = fewer false positives, may miss quiet notes\nLower = more sensitive, may detect noise')
+        pitch_row1.addWidget(self.voiced_confidence_spin)
+
+        # Energy threshold
+        pitch_row1.addWidget(QLabel('Energy Threshold:'))
+        self.energy_threshold_spin = QDoubleSpinBox()
+        self.energy_threshold_spin.setRange(0.0, 0.5)
+        self.energy_threshold_spin.setValue(0.15)
+        self.energy_threshold_spin.setSingleStep(0.05)
+        self.energy_threshold_spin.setDecimals(2)
+        self.energy_threshold_spin.setToolTip('Minimum audio energy to detect notes (0.0-0.5)\nHigher = ignores quiet sections\nLower = more sensitive to soft vocals')
+        pitch_row1.addWidget(self.energy_threshold_spin)
+
+        # Vocal isolation toggle
+        self.isolate_vocals_checkbox = QCheckBox('Isolate Vocals')
+        self.isolate_vocals_checkbox.setChecked(True)
+        self.isolate_vocals_checkbox.setToolTip('Apply vocal isolation before pitch detection\nUse for songs with background music\nDisable for a cappella tracks')
+        pitch_row1.addWidget(self.isolate_vocals_checkbox)
+
+        pitch_row1.addStretch()
+        pitch_settings_layout.addLayout(pitch_row1)
+
+        # Second row: Region selection
+        pitch_row2 = QHBoxLayout()
+
+        pitch_row2.addWidget(QLabel('Analyze Region:'))
+
+        pitch_row2.addWidget(QLabel('Start (s):'))
+        self.start_time_spin = QDoubleSpinBox()
+        self.start_time_spin.setRange(0.0, 9999.0)
+        self.start_time_spin.setValue(0.0)
+        self.start_time_spin.setSingleStep(1.0)
+        self.start_time_spin.setDecimals(1)
+        self.start_time_spin.setToolTip('Start time for analysis (0 = beginning)')
+        pitch_row2.addWidget(self.start_time_spin)
+
+        pitch_row2.addWidget(QLabel('End (s):'))
+        self.end_time_spin = QDoubleSpinBox()
+        self.end_time_spin.setRange(0.0, 9999.0)
+        self.end_time_spin.setValue(0.0)
+        self.end_time_spin.setSingleStep(1.0)
+        self.end_time_spin.setDecimals(1)
+        self.end_time_spin.setSpecialValueText('End')
+        self.end_time_spin.setToolTip('End time for analysis (0 = full track)')
+        pitch_row2.addWidget(self.end_time_spin)
+
+        self.set_start_btn = QPushButton('← Set Start')
+        self.set_start_btn.clicked.connect(self.set_start_to_current_position)
+        self.set_start_btn.setToolTip('Set start time to current playback position')
+        pitch_row2.addWidget(self.set_start_btn)
+
+        self.set_end_btn = QPushButton('Set End →')
+        self.set_end_btn.clicked.connect(self.set_end_to_current_position)
+        self.set_end_btn.setToolTip('Set end time to current playback position')
+        pitch_row2.addWidget(self.set_end_btn)
+
+        self.reset_region_btn = QPushButton('Reset to Full Track')
+        self.reset_region_btn.clicked.connect(self.reset_analysis_region)
+        pitch_row2.addWidget(self.reset_region_btn)
+
+        pitch_row2.addStretch()
+        pitch_settings_layout.addLayout(pitch_row2)
+
+        pitch_settings_group.setLayout(pitch_settings_layout)
+        layout.addWidget(pitch_settings_group)
+
         # Run detection settings
         settings_group = QGroupBox('Vocal Run Detection Settings')
         settings_layout = QHBoxLayout()
@@ -1336,6 +1450,25 @@ class VocalCoachApp(QMainWindow):
         # Clear download label after a few seconds
         QTimer.singleShot(3000, lambda: self.download_label.setText(''))
 
+    def reset_analysis_region(self):
+        """Reset the analysis region to full track"""
+        self.start_time_spin.setValue(0.0)
+        self.end_time_spin.setValue(0.0)
+
+    def set_start_to_current_position(self):
+        """Set the start time to current playback position"""
+        if hasattr(self, 'audio_player'):
+            current_pos = self.audio_player.current_position
+            self.start_time_spin.setValue(round(current_pos, 1))
+            self.statusBar().showMessage(f'Start time set to {current_pos:.1f}s', 2000)
+
+    def set_end_to_current_position(self):
+        """Set the end time to current playback position"""
+        if hasattr(self, 'audio_player'):
+            current_pos = self.audio_player.current_position
+            self.end_time_spin.setValue(round(current_pos, 1))
+            self.statusBar().showMessage(f'End time set to {current_pos:.1f}s', 2000)
+
     def analyze_pitch(self):
         """Analyze pitch from the loaded audio"""
         if self.audio is None:
@@ -1355,9 +1488,27 @@ class VocalCoachApp(QMainWindow):
         max_duration = self.max_duration_spin.value()
         max_gap = self.max_gap_spin.value()
 
+        # Get pitch detection parameters
+        voiced_threshold = self.voiced_confidence_spin.value()
+        energy_threshold = self.energy_threshold_spin.value()
+        isolate_vocals = self.isolate_vocals_checkbox.isChecked()
+
+        # Get region selection
+        start_time = self.start_time_spin.value() if self.start_time_spin.value() > 0 else None
+        end_time = self.end_time_spin.value() if self.end_time_spin.value() > 0 else None
+
+        # Validate region
+        if end_time is not None and start_time is not None and end_time <= start_time:
+            self.statusBar().showMessage('Error: End time must be greater than start time')
+            self.analyze_btn.setEnabled(True)
+            self.analysis_progress.setVisible(False)
+            return
+
         # Create and start analysis thread
         self.analysis_thread = PitchAnalysisThread(
-            self.audio, self.sr, min_notes, max_duration, max_gap
+            self.audio, self.sr, min_notes, max_duration, max_gap,
+            voiced_threshold, energy_threshold, isolate_vocals,
+            start_time, end_time
         )
         self.analysis_thread.progress.connect(self.on_analysis_progress)
         self.analysis_thread.progress_percent.connect(self.on_analysis_progress_percent)
