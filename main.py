@@ -795,51 +795,65 @@ class AudioSynthPlayer(QThread):
         self.stop_flag = False
 
     def generate_note_audio(self, frequency, duration, sample_rate=44100):
-        """Generate audio waveform for a single note with envelope"""
+        """Generate plucked string sound using Karplus-Strong algorithm
+
+        This produces a guitar/harp-like sound that is much more pleasant than sine waves.
+        No new dependencies required - uses only numpy.
+        """
         # Number of samples
         num_samples = int(duration * sample_rate)
 
         if num_samples == 0:
             return np.array([], dtype=np.float32)
 
-        # Time array
-        t = np.linspace(0, duration, num_samples, False)
+        # Calculate delay length (period of the frequency)
+        delay_samples = int(sample_rate / frequency)
 
-        # Generate sine wave at the given frequency (fundamental)
-        note_audio = 0.6 * np.sin(2 * np.pi * frequency * t)
+        # Ensure minimum delay line length
+        if delay_samples < 2:
+            delay_samples = 2
 
-        # Add harmonics for richer sound (but quieter to prevent clipping)
-        note_audio += 0.25 * np.sin(2 * np.pi * frequency * 2 * t)  # Octave
-        note_audio += 0.15 * np.sin(2 * np.pi * frequency * 1.5 * t)  # Fifth
+        # Initialize delay line with noise burst (the "pluck")
+        # This simulates plucking a string
+        delay_line = np.random.uniform(-0.5, 0.5, delay_samples)
 
-        # Apply ADSR envelope for more natural sound
-        # Attack (20ms ramp up - longer to reduce clicks)
-        attack_samples = int(0.02 * sample_rate)
-        if num_samples > attack_samples:
+        # Generate samples using Karplus-Strong feedback loop
+        output = np.zeros(num_samples)
+
+        for i in range(num_samples):
+            # Output current sample from delay line
+            output[i] = delay_line[0]
+
+            # Apply lowpass filter for natural decay (averaging)
+            # The 0.996 factor controls the decay rate
+            new_sample = 0.996 * (delay_line[0] + delay_line[1]) / 2
+
+            # Shift delay line and add feedback
+            delay_line = np.roll(delay_line, -1)
+            delay_line[-1] = new_sample
+
+        # Apply overall envelope for more natural sound
+        # Attack (10ms ramp up to smooth the initial pluck)
+        attack_samples = int(0.01 * sample_rate)
+        if num_samples > attack_samples and attack_samples > 0:
             attack_envelope = np.linspace(0, 1, attack_samples)
-            note_audio[:attack_samples] *= attack_envelope
+            output[:attack_samples] *= attack_envelope
 
-        # Release (100ms ramp down at end - longer for smoother end)
+        # Release (100ms ramp down at end for smooth ending)
         release_samples = int(0.1 * sample_rate)
-        if num_samples > release_samples:
+        if num_samples > release_samples and release_samples > 0:
             release_envelope = np.linspace(1, 0, release_samples)
-            note_audio[-release_samples:] *= release_envelope
+            output[-release_samples:] *= release_envelope
 
-        # Apply a gentle overall envelope to ensure smooth start and end
-        if num_samples > 100:
-            # Smooth first and last 50 samples
-            note_audio[:50] *= np.linspace(0, 1, 50) ** 2
-            note_audio[-50:] *= np.linspace(1, 0, 50) ** 2
-
-        # Normalize carefully
-        max_val = np.max(np.abs(note_audio))
+        # Normalize to prevent clipping
+        max_val = np.max(np.abs(output))
         if max_val > 0.001:  # Avoid division by very small numbers
-            note_audio = note_audio / max_val
+            output = output / max_val
 
-        # Reduce volume to prevent clipping
-        note_audio *= 0.5
+        # Reduce volume to comfortable listening level
+        output *= 0.6
 
-        return note_audio.astype(np.float32)
+        return output.astype(np.float32)
 
     def run(self):
         """Play notes using synthesized audio"""
