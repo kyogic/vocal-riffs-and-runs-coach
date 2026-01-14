@@ -279,6 +279,73 @@ class PitchDetector:
                         variation = np.mean(neighbors)
                         voiced_probs[i] = max(0.0, 1.0 - variation * 10)
 
+        elif self.algorithm == 'crepe':
+            # CREPE algorithm - Deep learning based, very accurate but slower
+            try:
+                import crepe
+
+                # CREPE expects 16kHz sample rate, resample if needed
+                target_sr = 16000
+                if self.sr != target_sr:
+                    audio_resampled = librosa.resample(audio, orig_sr=self.sr, target_sr=target_sr)
+                else:
+                    audio_resampled = audio
+
+                # Run CREPE (model_capacity: 'tiny', 'small', 'medium', 'large', 'full')
+                # Using 'small' for balance between speed and accuracy
+                time, frequency, confidence, activation = crepe.predict(
+                    audio_resampled,
+                    target_sr,
+                    viterbi=True,  # Use Viterbi decoding for smoother pitch contours
+                    model_capacity='small',  # Balance between speed and accuracy
+                    step_size=10  # milliseconds between predictions
+                )
+
+                # Resample CREPE output to match our hop_length
+                target_frames = int(len(audio) / self.hop_length)
+                time_frames = np.arange(target_frames) * self.hop_length / self.sr
+
+                # Interpolate frequency and confidence to match our frame rate
+                f0 = np.interp(time_frames, time, frequency)
+                voiced_probs = np.interp(time_frames, time, confidence)
+
+                # Filter out frequencies outside our vocal range
+                f0[(f0 < self.fmin) | (f0 > self.fmax)] = np.nan
+
+                # Set unvoiced regions to NaN based on confidence threshold
+                # CREPE's confidence is already quite good, so we use a lower threshold
+                f0[voiced_probs < 0.3] = np.nan
+                voiced_flag = ~np.isnan(f0)
+
+            except ImportError:
+                print("ERROR: CREPE not installed. Install with: pip install crepe tensorflow")
+                print("Falling back to pYIN algorithm...")
+                # Fall back to pYIN
+                f0, voiced_flag, voiced_probs = librosa.pyin(
+                    audio,
+                    fmin=self.fmin,
+                    fmax=self.fmax,
+                    sr=self.sr,
+                    hop_length=self.hop_length,
+                    frame_length=2048,
+                    win_length=1800,
+                    fill_na=None
+                )
+            except Exception as e:
+                print(f"ERROR running CREPE: {str(e)}")
+                print("Falling back to pYIN algorithm...")
+                # Fall back to pYIN
+                f0, voiced_flag, voiced_probs = librosa.pyin(
+                    audio,
+                    fmin=self.fmin,
+                    fmax=self.fmax,
+                    sr=self.sr,
+                    hop_length=self.hop_length,
+                    frame_length=2048,
+                    win_length=1800,
+                    fill_na=None
+                )
+
         else:  # pyin (default)
             # pYIN algorithm - probabilistic YIN with better handling of noise
             f0, voiced_flag, voiced_probs = librosa.pyin(
@@ -1409,7 +1476,8 @@ class VocalCoachApp(QMainWindow):
         self.algorithm_combo = QComboBox()
         self.algorithm_combo.addItem('pYIN (Probabilistic)', 'pyin')
         self.algorithm_combo.addItem('YIN (Simple)', 'yin')
-        self.algorithm_combo.setToolTip('Pitch detection algorithm\npYIN: Better for noisy audio, more robust\nYIN: Simpler, sometimes more accurate for clean vocals')
+        self.algorithm_combo.addItem('CREPE (Deep Learning)', 'crepe')
+        self.algorithm_combo.setToolTip('Pitch detection algorithm\npYIN: Better for noisy audio, more robust\nYIN: Simpler, sometimes more accurate for clean vocals\nCREPE: Deep learning model, most accurate (90-95%), slower')
         pitch_row1.addWidget(self.algorithm_combo)
 
         # Voiced confidence threshold
