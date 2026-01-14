@@ -87,17 +87,39 @@ class YouTubeDownloader(QThread):
             self.error.emit(f'Download error: {str(e)}')
 
 
+class BPMDetectionThread(QThread):
+    """Background thread for BPM detection"""
+    progress = pyqtSignal(str)  # Progress message
+    finished = pyqtSignal(float)  # BPM value
+    error = pyqtSignal(str)  # Error message
+
+    def __init__(self, audio, sr):
+        super().__init__()
+        self.audio = audio
+        self.sr = sr
+
+    def run(self):
+        """Detect BPM in background"""
+        try:
+            self.progress.emit('Detecting tempo (BPM)...')
+            tempo, _ = librosa.beat.beat_track(y=self.audio, sr=self.sr)
+            bpm = float(tempo) if np.isscalar(tempo) else float(tempo[0])
+            self.progress.emit(f'Detected tempo: {bpm:.1f} BPM')
+            self.finished.emit(bpm)
+        except Exception as e:
+            self.error.emit(f'Could not detect BPM: {str(e)}')
+
+
 class PitchAnalysisThread(QThread):
     """Background thread for pitch analysis"""
     progress = pyqtSignal(str)  # Progress message
     progress_percent = pyqtSignal(int)  # Progress percentage (0-100)
-    finished = pyqtSignal(list, object, object, list, float)  # notes, times, f0, runs, bpm
+    finished = pyqtSignal(list, object, object, list)  # notes, times, f0, runs
     error = pyqtSignal(str)  # Error message
 
     def __init__(self, audio, sr, min_notes=4, max_note_duration=0.4, max_gap=0.2,
                  voiced_threshold=0.75, energy_threshold=0.15, isolate_vocals=True,
-                 start_time=None, end_time=None, algorithm='pyin', min_note_duration=0.05,
-                 detect_bpm=True):
+                 start_time=None, end_time=None, algorithm='pyin', min_note_duration=0.05):
         super().__init__()
         self.audio = audio
         self.sr = sr
@@ -111,8 +133,6 @@ class PitchAnalysisThread(QThread):
         self.end_time = end_time
         self.algorithm = algorithm
         self.min_note_duration = min_note_duration
-        self.detect_bpm = detect_bpm
-        self.bpm = None
 
     def run(self):
         """Analyze pitch in background"""
@@ -153,7 +173,7 @@ class PitchAnalysisThread(QThread):
                 times = times + self.start_time
 
             self.progress.emit('Detecting vocal runs and scales...')
-            self.progress_percent.emit(70)
+            self.progress_percent.emit(80)
             runs_detector = RunsDetector(
                 min_notes=self.min_notes,
                 max_note_duration=self.max_note_duration,
@@ -161,23 +181,9 @@ class PitchAnalysisThread(QThread):
             )
             runs = runs_detector.detect_runs(notes)
 
-            # Detect BPM/tempo
-            bpm = 0.0
-            if self.detect_bpm:
-                try:
-                    self.progress.emit('Detecting tempo (BPM)...')
-                    self.progress_percent.emit(90)
-                    # Use full audio for BPM detection (not just the region)
-                    tempo, _ = librosa.beat.beat_track(y=self.audio, sr=self.sr)
-                    bpm = float(tempo) if np.isscalar(tempo) else float(tempo[0])
-                    self.progress.emit(f'Detected tempo: {bpm:.1f} BPM')
-                except Exception as e:
-                    self.progress.emit(f'Could not detect BPM: {str(e)}')
-                    bpm = 0.0
-
             self.progress.emit(f'Analysis complete! Detected {len(notes)} notes and {len(runs)} runs')
             self.progress_percent.emit(100)
-            self.finished.emit(notes, times, f0, runs, bpm)
+            self.finished.emit(notes, times, f0, runs)
 
         except Exception as e:
             self.error.emit(f'Analysis error: {str(e)}')
@@ -1279,6 +1285,11 @@ class VocalCoachApp(QMainWindow):
         self.analyze_btn.clicked.connect(self.analyze_pitch)
         self.analyze_btn.setEnabled(False)
 
+        self.detect_bpm_btn = QPushButton('🎵 Detect BPM')
+        self.detect_bpm_btn.clicked.connect(self.detect_bpm)
+        self.detect_bpm_btn.setEnabled(False)
+        self.detect_bpm_btn.setToolTip('Detect the tempo/BPM of the song')
+
         self.export_btn = QPushButton('💾 Export Notes')
         self.export_btn.clicked.connect(self.export_notes)
         self.export_btn.setEnabled(False)
@@ -1287,6 +1298,7 @@ class VocalCoachApp(QMainWindow):
         controls_layout.addWidget(self.play_btn)
         controls_layout.addWidget(self.stop_btn)
         controls_layout.addWidget(self.analyze_btn)
+        controls_layout.addWidget(self.detect_bpm_btn)
         controls_layout.addWidget(self.export_btn)
         controls_layout.addStretch()
 
@@ -1553,6 +1565,7 @@ class VocalCoachApp(QMainWindow):
                 self.file_label.setText(f'Loaded: {os.path.basename(file_path)}')
                 self.play_btn.setEnabled(True)
                 self.analyze_btn.setEnabled(True)
+                self.detect_bpm_btn.setEnabled(True)
                 self.progress_bar.setValue(0)
 
                 # Update time label
@@ -1619,6 +1632,7 @@ class VocalCoachApp(QMainWindow):
             self.file_label.setText(f'Loaded from YouTube: {filename}')
             self.play_btn.setEnabled(True)
             self.analyze_btn.setEnabled(True)
+            self.detect_bpm_btn.setEnabled(True)
             self.progress_bar.setValue(0)
 
             # Update time label
@@ -1721,8 +1735,7 @@ class VocalCoachApp(QMainWindow):
         self.analysis_thread = PitchAnalysisThread(
             self.audio, self.sr, min_notes, max_duration, max_gap,
             voiced_threshold, energy_threshold, isolate_vocals,
-            start_time, end_time, algorithm, min_note_duration,
-            detect_bpm=True
+            start_time, end_time, algorithm, min_note_duration
         )
         self.analysis_thread.progress.connect(self.on_analysis_progress)
         self.analysis_thread.progress_percent.connect(self.on_analysis_progress_percent)
@@ -1739,7 +1752,7 @@ class VocalCoachApp(QMainWindow):
         """Handle analysis progress percentage updates"""
         self.analysis_progress.setValue(percent)
 
-    def on_analysis_finished(self, notes, times, f0, runs, bpm):
+    def on_analysis_finished(self, notes, times, f0, runs):
         """Handle completed analysis"""
         self.analyze_btn.setEnabled(True)
         self.reanalyze_btn.setEnabled(True)
@@ -1751,13 +1764,6 @@ class VocalCoachApp(QMainWindow):
         self.notes_data = notes
         self.runs_data = runs
         self.current_run_index = 0
-        self.bpm = bpm
-
-        # Update BPM display
-        if bpm > 0:
-            self.bpm_label.setText(f'BPM: {bpm:.1f}')
-        else:
-            self.bpm_label.setText('BPM: --')
 
         # Store times and f0 for reanalysis
         self.times = times
@@ -1800,6 +1806,40 @@ class VocalCoachApp(QMainWindow):
         self.analysis_progress.setVisible(False)
         self.statusBar().showMessage(f'Error analyzing pitch: {error_msg}')
         print(f"Error analyzing pitch: {error_msg}")
+
+    def detect_bpm(self):
+        """Detect BPM from the loaded audio"""
+        if self.audio is None:
+            return
+
+        # Disable BPM button during detection
+        self.detect_bpm_btn.setEnabled(False)
+        self.statusBar().showMessage('Detecting BPM...')
+
+        # Create and start BPM detection thread
+        self.bpm_thread = BPMDetectionThread(self.audio, self.sr)
+        self.bpm_thread.progress.connect(self.on_bpm_progress)
+        self.bpm_thread.finished.connect(self.on_bpm_finished)
+        self.bpm_thread.error.connect(self.on_bpm_error)
+        self.bpm_thread.start()
+
+    def on_bpm_progress(self, message):
+        """Handle BPM detection progress updates"""
+        self.statusBar().showMessage(message)
+
+    def on_bpm_finished(self, bpm):
+        """Handle completed BPM detection"""
+        self.detect_bpm_btn.setEnabled(True)
+        self.bpm = bpm
+        self.bpm_label.setText(f'BPM: {bpm:.1f}')
+        self.statusBar().showMessage(f'BPM detected: {bpm:.1f}', 3000)
+
+    def on_bpm_error(self, error_msg):
+        """Handle BPM detection errors"""
+        self.detect_bpm_btn.setEnabled(True)
+        self.bpm_label.setText('BPM: --')
+        self.statusBar().showMessage(f'Error detecting BPM: {error_msg}')
+        print(f"Error detecting BPM: {error_msg}")
 
     def toggle_play(self):
         """Toggle play/pause"""
