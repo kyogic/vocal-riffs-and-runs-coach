@@ -114,7 +114,7 @@ class PitchAnalysisThread(QThread):
     """Background thread for pitch analysis"""
     progress = pyqtSignal(str)  # Progress message
     progress_percent = pyqtSignal(int)  # Progress percentage (0-100)
-    finished = pyqtSignal(list, object, object, list)  # notes, times, f0, runs
+    finished = pyqtSignal(list, object, object, list, list)  # notes, times, f0, runs, segments
     error = pyqtSignal(str)  # Error message
 
     def __init__(self, audio, sr, min_notes=4, max_note_duration=0.4, max_gap=0.2,
@@ -172,18 +172,23 @@ class PitchAnalysisThread(QThread):
                     note['time'] += self.start_time
                 times = times + self.start_time
 
-            self.progress.emit('Detecting vocal runs and scales...')
+            self.progress.emit('Creating note segments and detecting runs...')
             self.progress_percent.emit(80)
             runs_detector = RunsDetector(
                 min_notes=self.min_notes,
                 max_note_duration=self.max_note_duration,
                 max_gap=self.max_gap
             )
+
+            # Create segments from ALL notes (shows all detected notes)
+            segments = runs_detector.create_segments(notes, max_gap=0.5)
+
+            # Also detect runs (fast vocal runs/riffs)
             runs = runs_detector.detect_runs(notes)
 
-            self.progress.emit(f'Analysis complete! Detected {len(notes)} notes and {len(runs)} runs')
+            self.progress.emit(f'Analysis complete! Detected {len(segments)} segments and {len(runs)} runs')
             self.progress_percent.emit(100)
-            self.finished.emit(notes, times, f0, runs)
+            self.finished.emit(notes, times, f0, runs, segments)
 
         except Exception as e:
             self.error.emit(f'Analysis error: {str(e)}')
@@ -549,6 +554,82 @@ class RunsDetector:
         self.max_note_duration = max_note_duration
         self.max_gap = max_gap
         self.scale_detector = ScaleDetector()
+
+    def create_segments(self, notes, max_gap=0.5):
+        """
+        Group all notes into segments (consecutive notes separated by gaps)
+        This shows ALL detected notes, not just runs
+
+        Args:
+            notes: List of note dictionaries
+            max_gap: Maximum gap between notes to group as same segment (default 0.5s)
+
+        Returns:
+            List of segment dictionaries
+        """
+        if not notes:
+            return []
+
+        segments = []
+        current_segment = []
+
+        for i, note in enumerate(notes):
+            # Check gap from previous note
+            if current_segment:
+                prev_note = current_segment[-1]
+                gap = note['time'] - (prev_note['time'] + prev_note['duration'])
+                gap_ok = gap <= max_gap
+            else:
+                gap_ok = True
+
+            if gap_ok:
+                # Add to current segment
+                current_segment.append(note)
+            else:
+                # Save current segment and start new one
+                if current_segment:
+                    segments.append(self._create_segment_info(current_segment, len(segments) + 1))
+                current_segment = [note]
+
+        # Don't forget the last segment
+        if current_segment:
+            segments.append(self._create_segment_info(current_segment, len(segments) + 1))
+
+        return segments
+
+    def _create_segment_info(self, segment_notes, segment_number):
+        """Create a segment info dictionary from a list of notes"""
+        start_time = segment_notes[0]['time']
+        last_note = segment_notes[-1]
+        end_time = last_note['time'] + last_note['duration']
+
+        # Calculate average note duration
+        avg_duration = sum(n['duration'] for n in segment_notes) / len(segment_notes)
+
+        # Get note range
+        note_names = [n['note'] for n in segment_notes]
+
+        # Detect scale pattern if enough notes
+        if len(note_names) >= 3:
+            scale_info = self.scale_detector.detect_scale(note_names)
+        else:
+            scale_info = {'scale': 'Unknown', 'root': None, 'confidence': 0.0}
+
+        return {
+            'segment_number': segment_number,
+            'start_time': start_time,
+            'end_time': end_time,
+            'duration': end_time - start_time,
+            'note_count': len(segment_notes),
+            'notes': segment_notes,
+            'note_names': note_names,
+            'avg_note_duration': avg_duration,
+            'first_note': note_names[0],
+            'last_note': note_names[-1],
+            'scale': scale_info['scale'],
+            'scale_root': scale_info['root'],
+            'scale_confidence': scale_info['confidence']
+        }
 
     def detect_runs(self, notes):
         """
@@ -1176,7 +1257,9 @@ class VocalCoachApp(QMainWindow):
         self.is_playing_notes = False
         self.notes_data = []
         self.runs_data = []
+        self.segments_data = []
         self.current_run_index = 0
+        self.current_segment_index = 0
         self.bpm = 0.0  # Detected BPM
 
         # Connect player signals
@@ -1528,8 +1611,23 @@ class VocalCoachApp(QMainWindow):
         playback_group.setLayout(playback_layout)
         layout.addWidget(playback_group)
 
-        # Runs list panel
-        runs_list_group = QGroupBox('Detected Runs')
+        # Segments and Runs panel (side by side)
+        lists_layout = QHBoxLayout()
+
+        # Segments list panel (all detected notes)
+        segments_list_group = QGroupBox('Note Segments (All Detected Notes)')
+        segments_list_layout = QVBoxLayout()
+
+        self.segments_list = QListWidget()
+        self.segments_list.setMaximumHeight(150)
+        self.segments_list.itemClicked.connect(self.on_segment_list_item_clicked)
+        segments_list_layout.addWidget(self.segments_list)
+
+        segments_list_group.setLayout(segments_list_layout)
+        lists_layout.addWidget(segments_list_group)
+
+        # Runs list panel (fast vocal runs)
+        runs_list_group = QGroupBox('Detected Runs (Fast Riffs)')
         runs_list_layout = QVBoxLayout()
 
         self.runs_list = QListWidget()
@@ -1538,7 +1636,9 @@ class VocalCoachApp(QMainWindow):
         runs_list_layout.addWidget(self.runs_list)
 
         runs_list_group.setLayout(runs_list_layout)
-        layout.addWidget(runs_list_group)
+        lists_layout.addWidget(runs_list_group)
+
+        layout.addLayout(lists_layout)
 
         # Status bar
         self.statusBar().showMessage('Ready')
@@ -1752,7 +1852,7 @@ class VocalCoachApp(QMainWindow):
         """Handle analysis progress percentage updates"""
         self.analysis_progress.setValue(percent)
 
-    def on_analysis_finished(self, notes, times, f0, runs):
+    def on_analysis_finished(self, notes, times, f0, runs, segments):
         """Handle completed analysis"""
         self.analyze_btn.setEnabled(True)
         self.reanalyze_btn.setEnabled(True)
@@ -1760,10 +1860,12 @@ class VocalCoachApp(QMainWindow):
         # Hide progress bar after brief delay
         QTimer.singleShot(2000, lambda: self.analysis_progress.setVisible(False))
 
-        # Store notes and runs data
+        # Store notes, runs, and segments data
         self.notes_data = notes
         self.runs_data = runs
+        self.segments_data = segments
         self.current_run_index = 0
+        self.current_segment_index = 0
 
         # Store times and f0 for reanalysis
         self.times = times
@@ -1772,7 +1874,8 @@ class VocalCoachApp(QMainWindow):
         # Update visualization
         self.viz_widget.update_data(self.audio, self.sr, times, f0, notes, runs)
 
-        # Populate runs list
+        # Populate segments and runs lists
+        self.populate_segments_list()
         self.populate_runs_list()
 
         # Enable export and run navigation
@@ -2093,6 +2196,69 @@ class VocalCoachApp(QMainWindow):
                 self.statusBar().showMessage(f'Error exporting runs: {str(e)}')
                 print(f"Error exporting runs: {e}")
 
+    def populate_segments_list(self):
+        """Populate the segments list widget with all detected note segments"""
+        self.segments_list.clear()
+
+        if not self.segments_data:
+            item = QListWidgetItem('No notes detected')
+            item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
+            self.segments_list.addItem(item)
+            return
+
+        for i, segment in enumerate(self.segments_data):
+            # Format: "Segment 1: 3 notes @ 10.5s | C4 → D4 → E4"
+            note_sequence = ' → '.join(segment['note_names'][:5])  # Show first 5 notes
+            if segment['note_count'] > 5:
+                note_sequence += '...'
+
+            # Add scale information if available
+            if segment['note_count'] >= 3 and segment['scale'] != 'Unknown':
+                scale_text = f"{segment['scale_root']} {segment['scale']}" if segment['scale_root'] else segment['scale']
+                confidence_pct = int(segment['scale_confidence'] * 100)
+                scale_display = f" | 🎵 {scale_text} ({confidence_pct}%)"
+            else:
+                scale_display = ""
+
+            item_text = (
+                f"Segment {i+1}: {segment['note_count']} notes ({segment['duration']:.2f}s) "
+                f"@ {segment['start_time']:.1f}s{scale_display} | "
+                f"{note_sequence}"
+            )
+
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, i)  # Store segment index
+            self.segments_list.addItem(item)
+
+    def on_segment_list_item_clicked(self, item):
+        """Handle clicking on a segment in the list"""
+        segment_index = item.data(Qt.UserRole)
+        if segment_index is not None:
+            self.current_segment_index = segment_index
+            self._jump_to_segment(segment_index)
+
+            # Highlight the selected item
+            self.segments_list.setCurrentItem(item)
+
+    def _jump_to_segment(self, segment_index):
+        """Jump to a specific segment"""
+        if not self.segments_data or segment_index >= len(self.segments_data):
+            return
+
+        segment = self.segments_data[segment_index]
+
+        # Seek to segment start
+        self.audio_player.current_position = segment['start_time']
+        self.progress_bar.setValue(int((segment['start_time'] / self.duration) * 1000))
+        self.update_time_label(segment['start_time'])
+        self.viz_widget.update_position(segment['start_time'])
+
+        # Show segment info in status bar
+        note_sequence = ' → '.join(segment['note_names'])
+        self.statusBar().showMessage(
+            f"Segment {segment_index + 1}: {segment['note_count']} notes | {note_sequence}"
+        )
+
     def populate_runs_list(self):
         """Populate the runs list widget with detected runs"""
         self.runs_list.clear()
@@ -2147,22 +2313,26 @@ class VocalCoachApp(QMainWindow):
         max_duration = self.max_duration_spin.value()
         max_gap = self.max_gap_spin.value()
 
-        # Re-detect runs with new parameters
+        # Re-detect runs and segments with new parameters
         runs_detector = RunsDetector(
             min_notes=min_notes,
             max_note_duration=max_duration,
             max_gap=max_gap
         )
+        segments = runs_detector.create_segments(self.notes_data, max_gap=0.5)
         runs = runs_detector.detect_runs(self.notes_data)
 
-        # Update runs data
+        # Update runs and segments data
+        self.segments_data = segments
         self.runs_data = runs
         self.current_run_index = 0
+        self.current_segment_index = 0
 
         # Update visualization with new runs
         self.viz_widget.update_data(self.audio, self.sr, self.times, self.f0, self.notes_data, runs)
 
-        # Populate runs list
+        # Populate segments and runs lists
+        self.populate_segments_list()
         self.populate_runs_list()
 
         # Update UI
