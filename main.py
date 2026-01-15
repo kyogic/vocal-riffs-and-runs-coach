@@ -937,10 +937,10 @@ class VisualizationWidget(FigureCanvas):
             time_range = time_max - time_min
             padding = time_range * 0.05 if time_range > 0 else 0.5  # 5% padding or 0.5s minimum
             self.ax2.set_xlim(max(0, time_min - padding), time_max + padding)
+            # Only show legend when we have pitch data
+            self.ax2.legend()
         else:
             self.ax2.set_xlim(0, len(self.audio) / self.sr if self.audio is not None else 10)
-
-        self.ax2.legend()
 
         # Plot current position line and store reference (animated for blit)
         self.position_line2 = self.ax2.axvline(x=self.current_time, color='r', linestyle='--', linewidth=2, animated=True)
@@ -2004,6 +2004,30 @@ class VocalCoachApp(QMainWindow):
 
 
 def main():
+    # Print diagnostic information
+    print("=" * 60)
+    print("VOCAL COACH - Startup Diagnostics")
+    print("=" * 60)
+    print(f"Python: {sys.version}")
+    print(f"Python executable: {sys.executable}")
+    print()
+
+    # Check CREPE availability
+    try:
+        import crepe
+        import tensorflow
+        print("✓ CREPE is installed and available")
+        print(f"  CREPE version: {crepe.__version__ if hasattr(crepe, '__version__') else 'unknown'}")
+        print(f"  TensorFlow version: {tensorflow.__version__}")
+    except ImportError as e:
+        print("✗ CREPE is NOT available")
+        print(f"  Error: {e}")
+        print()
+        print("  To install CREPE, run:")
+        print(f"  {sys.executable} -m pip install crepe tensorflow")
+    print("=" * 60)
+    print()
+
     app = QApplication(sys.argv)
     window = VocalCoachApp()
     window.show()
