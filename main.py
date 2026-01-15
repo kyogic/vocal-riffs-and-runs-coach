@@ -307,8 +307,17 @@ class PitchDetector:
                 f0[voiced_probs < 0.3] = np.nan
                 voiced_flag = ~np.isnan(f0)
 
-            except ImportError:
-                print("ERROR: CREPE not installed. Install with: pip install crepe tensorflow")
+            except ImportError as e:
+                error_str = str(e)
+                if "DLL load failed" in error_str or "_pywrap_tensorflow_internal" in error_str:
+                    print("ERROR: TensorFlow DLL conflict with PyQt5")
+                    print("This is a known Windows issue where TensorFlow and PyQt5 conflict.")
+                    print("Unfortunately, CREPE cannot be used in the GUI on your system.")
+                    print("However, pYIN works great for vocal pitch detection!")
+                    self.progress.emit("⚠️ CREPE unavailable due to DLL conflict - using pYIN instead")
+                else:
+                    print("ERROR: CREPE not installed. Install with: pip install crepe tensorflow")
+                    self.progress.emit("⚠️ CREPE not installed - using pYIN instead")
                 print("Falling back to pYIN algorithm...")
                 # Fall back to pYIN
                 f0, voiced_flag, voiced_probs = librosa.pyin(
@@ -322,6 +331,7 @@ class PitchDetector:
                 )
             except Exception as e:
                 print(f"ERROR running CREPE: {str(e)}")
+                self.progress.emit("⚠️ CREPE error - using pYIN instead")
                 print("Falling back to pYIN algorithm...")
                 # Fall back to pYIN
                 f0, voiced_flag, voiced_probs = librosa.pyin(
@@ -1350,7 +1360,7 @@ class VocalCoachApp(QMainWindow):
         self.algorithm_combo.addItem('pYIN (Probabilistic)', 'pyin')
         self.algorithm_combo.addItem('YIN (Simple)', 'yin')
         self.algorithm_combo.addItem('CREPE (Deep Learning)', 'crepe')
-        self.algorithm_combo.setToolTip('Pitch detection algorithm\npYIN: Better for noisy audio, more robust\nYIN: Simpler, sometimes more accurate for clean vocals\nCREPE: Deep learning model, most accurate (90-95%), slower')
+        self.algorithm_combo.setToolTip('Pitch detection algorithm\npYIN: Better for noisy audio, more robust (RECOMMENDED)\nYIN: Simpler, sometimes more accurate for clean vocals\nCREPE: Deep learning model, most accurate (90-95%), slower\n       May have DLL conflicts on Windows - will auto-fallback to pYIN')
         pitch_row1.addWidget(self.algorithm_combo)
 
         # Voiced confidence threshold
@@ -2079,48 +2089,8 @@ def main():
     print(f"Python architecture: {struct.calcsize('P') * 8}-bit")
     print(f"Platform: {platform.platform()}")
     print()
-
-    # Check CREPE availability
-    try:
-        import crepe
-        import tensorflow
-        print("✓ CREPE is installed and available")
-        print(f"  CREPE version: {crepe.__version__ if hasattr(crepe, '__version__') else 'unknown'}")
-        print(f"  TensorFlow version: {tensorflow.__version__}")
-    except ImportError as e:
-        print("✗ CREPE is NOT available")
-        error_str = str(e)
-        print(f"  Error: {error_str}")
-        print()
-
-        # Check for specific TensorFlow DLL error
-        if "DLL load failed" in error_str or "_pywrap_tensorflow_internal" in error_str:
-            print("  🔍 DIAGNOSIS: TensorFlow DLL initialization failed (Windows)")
-            print()
-            print("  Common causes:")
-            print("  1. CPU doesn't support AVX instructions (TensorFlow 2.6+ requires AVX)")
-            print("  2. Corrupted TensorFlow installation")
-            print("  3. Incompatible TensorFlow version")
-            print()
-            print("  ✅ RECOMMENDED: Use pYIN algorithm instead!")
-            print("  pYIN is specifically designed for vocal pitch detection,")
-            print("  works great, and has no DLL dependencies!")
-            print("  Just select 'pYIN' in the Algorithm dropdown.")
-            print()
-            print("  💡 If you want to try fixing CREPE:")
-            print("  Step 1: Try reinstalling TensorFlow:")
-            print(f"  {sys.executable} -m pip uninstall tensorflow -y")
-            print(f"  {sys.executable} -m pip install tensorflow==2.10.0")
-            print()
-            print("  Step 2: If that doesn't work, your CPU may not support AVX.")
-            print("  TensorFlow 2.6+ requires AVX CPU instructions.")
-            print("  Older TensorFlow versions (2.5 or below) might work but are outdated.")
-        elif "No module named" in error_str:
-            print("  To install CREPE, run:")
-            print(f"  {sys.executable} -m pip install crepe tensorflow")
-        else:
-            print("  To fix, run:")
-            print(f"  {sys.executable} -m pip install crepe tensorflow")
+    print("Note: CREPE availability will be checked when you select it.")
+    print("      (Delayed import to avoid conflicts with PyQt5)")
     print("=" * 60)
     print()
 
