@@ -2004,12 +2004,17 @@ class VocalCoachApp(QMainWindow):
 
 
 def main():
+    import platform
+    import struct
+
     # Print diagnostic information
     print("=" * 60)
     print("VOCAL COACH - Startup Diagnostics")
     print("=" * 60)
     print(f"Python: {sys.version}")
     print(f"Python executable: {sys.executable}")
+    print(f"Python architecture: {struct.calcsize('P') * 8}-bit")
+    print(f"Platform: {platform.platform()}")
     print()
 
     # Check CREPE availability
@@ -2028,19 +2033,25 @@ def main():
         # Check for specific TensorFlow DLL error
         if "DLL load failed" in error_str or "_pywrap_tensorflow_internal" in error_str:
             print("  🔍 DIAGNOSIS: TensorFlow DLL initialization failed (Windows)")
-            print("  This is caused by missing Visual C++ Redistributables.")
             print()
-            print("  ⚠️  NOTE: This is NOT related to running from an external drive!")
-            print("  The issue is that Windows needs additional runtime libraries.")
+            print("  Common causes:")
+            print("  1. CPU doesn't support AVX instructions (TensorFlow 2.6+ requires AVX)")
+            print("  2. Corrupted TensorFlow installation")
+            print("  3. Incompatible TensorFlow version")
             print()
-            print("  ✅ SOLUTION 1 (Fix CREPE):")
-            print("  1. Download: https://aka.ms/vs/17/release/vc_redist.x64.exe")
-            print("  2. Install the Visual C++ Redistributable")
-            print("  3. Restart the app")
-            print()
-            print("  ✅ SOLUTION 2 (Use pYIN instead):")
-            print("  pYIN works great and has no DLL dependencies!")
+            print("  ✅ RECOMMENDED: Use pYIN algorithm instead!")
+            print("  pYIN is specifically designed for vocal pitch detection,")
+            print("  works great, and has no DLL dependencies!")
             print("  Just select 'pYIN' in the Algorithm dropdown.")
+            print()
+            print("  💡 If you want to try fixing CREPE:")
+            print("  Step 1: Try reinstalling TensorFlow:")
+            print(f"  {sys.executable} -m pip uninstall tensorflow -y")
+            print(f"  {sys.executable} -m pip install tensorflow==2.10.0")
+            print()
+            print("  Step 2: If that doesn't work, your CPU may not support AVX.")
+            print("  TensorFlow 2.6+ requires AVX CPU instructions.")
+            print("  Older TensorFlow versions (2.5 or below) might work but are outdated.")
         elif "No module named" in error_str:
             print("  To install CREPE, run:")
             print(f"  {sys.executable} -m pip install crepe tensorflow")
