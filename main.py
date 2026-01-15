@@ -140,7 +140,11 @@ class PitchAnalysisThread(QThread):
                 start_sample = int(self.start_time * self.sr) if self.start_time else 0
                 end_sample = int(self.end_time * self.sr) if self.end_time else len(self.audio)
                 audio_to_analyze = self.audio[start_sample:end_sample]
-                self.progress.emit(f'Analyzing region {self.start_time:.1f}s - {self.end_time:.1f}s')
+
+                # Format region message
+                start_str = f'{self.start_time:.1f}s' if self.start_time else 'start'
+                end_str = f'{self.end_time:.1f}s' if self.end_time else 'end'
+                self.progress.emit(f'Analyzing region {start_str} - {end_str}')
 
             if self.isolate_vocals:
                 self.progress.emit('Isolating vocals from background music...')
