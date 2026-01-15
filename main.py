@@ -315,7 +315,6 @@ class PitchDetector:
                     sr=self.sr,
                     hop_length=self.hop_length,
                     frame_length=2048,
-                    win_length=1800,
                     fill_na=None
                 )
             except Exception as e:
@@ -329,7 +328,6 @@ class PitchDetector:
                     sr=self.sr,
                     hop_length=self.hop_length,
                     frame_length=2048,
-                    win_length=1800,
                     fill_na=None
                 )
 
@@ -342,7 +340,6 @@ class PitchDetector:
                 sr=self.sr,
                 hop_length=self.hop_length,
                 frame_length=2048,  # Good frequency resolution
-                win_length=1800,    # Smaller window for better time resolution
                 fill_na=None        # Keep NaN for unvoiced regions (don't interpolate)
             )
 
