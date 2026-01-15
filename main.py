@@ -4,8 +4,11 @@ Vocal Riffs and Runs Coach
 A desktop application for vocal pitch detection and analysis
 """
 
-import sys
+# Fix DLL conflicts between PyQt5 and TensorFlow on Windows
 import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
+import sys
 import time
 import numpy as np
 import librosa
