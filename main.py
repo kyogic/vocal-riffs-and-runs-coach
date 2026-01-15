@@ -1348,6 +1348,14 @@ class VocalCoachApp(QMainWindow):
         self.min_note_duration_spin.setToolTip('Minimum note duration in milliseconds\nHigher = filters out very short detections (noise)\nLower = captures faster runs and quick notes\nDefault: 30ms for vocal runs')
         pitch_row1.addWidget(self.min_note_duration_spin)
 
+        # Quick BPM button
+        self.use_bpm_btn = QPushButton('Use BPM')
+        self.use_bpm_btn.setMaximumWidth(70)
+        self.use_bpm_btn.clicked.connect(self.set_min_duration_from_bpm)
+        self.use_bpm_btn.setEnabled(False)
+        self.use_bpm_btn.setToolTip('Set min note duration based on detected BPM (1/32 note)\nDetect BPM first!')
+        pitch_row1.addWidget(self.use_bpm_btn)
+
         # Vocal isolation toggle
         self.isolate_vocals_checkbox = QCheckBox('Isolate Vocals')
         self.isolate_vocals_checkbox.setChecked(False)  # Default OFF for a cappella
@@ -1614,16 +1622,19 @@ class VocalCoachApp(QMainWindow):
         isolate_vocals = self.isolate_vocals_checkbox.isChecked()
         algorithm = self.algorithm_combo.currentData()
 
-        # Calculate min_note_duration based on BPM if available
+        # Always use manual setting - user has full control
+        min_note_duration = self.min_note_duration_spin.value() / 1000.0  # Convert ms to seconds
+
+        # Show BPM info if available (for reference)
         if self.bpm and self.bpm > 0:
-            # Use BPM to calculate minimum duration (1/32nd note at detected BPM)
-            # This captures fast vocal runs and quick notes
             beat_duration = 60.0 / self.bpm
-            min_note_duration = beat_duration / 8  # Thirty-second note
-            self.statusBar().showMessage(f'Using BPM-based min note duration: {min_note_duration*1000:.0f}ms (1/32 note at {self.bpm:.0f} BPM)', 2000)
-        else:
-            # Fall back to manual setting
-            min_note_duration = self.min_note_duration_spin.value() / 1000.0  # Convert ms to seconds
+            suggested_32nd = beat_duration / 8  # Thirty-second note
+            suggested_16th = beat_duration / 4  # Sixteenth note
+            self.statusBar().showMessage(
+                f'Min note: {min_note_duration*1000:.0f}ms | BPM {self.bpm:.0f} suggests: '
+                f'1/32={suggested_32nd*1000:.0f}ms, 1/16={suggested_16th*1000:.0f}ms',
+                3000
+            )
 
         # Get region selection (parse MM:SS format)
         start_time = self.parse_mmss(self.start_time_input.text())
@@ -1729,7 +1740,15 @@ class VocalCoachApp(QMainWindow):
         self.detect_bpm_btn.setEnabled(True)
         self.bpm = bpm
         self.bpm_label.setText(f'BPM: {bpm:.1f}')
-        self.statusBar().showMessage(f'BPM detected: {bpm:.1f}', 3000)
+
+        # Enable the "Use BPM" button now that BPM is detected
+        self.use_bpm_btn.setEnabled(True)
+
+        # Calculate suggested min note duration
+        beat_duration = 60.0 / bpm
+        suggested_32nd = beat_duration / 8 * 1000  # in ms
+
+        self.statusBar().showMessage(f'BPM detected: {bpm:.1f} | Suggested min note: {suggested_32nd:.0f}ms (1/32 note)', 5000)
 
     def on_bpm_error(self, error_msg):
         """Handle BPM detection errors"""
@@ -1737,6 +1756,14 @@ class VocalCoachApp(QMainWindow):
         self.bpm_label.setText('BPM: --')
         self.statusBar().showMessage(f'Error detecting BPM: {error_msg}')
         print(f"Error detecting BPM: {error_msg}")
+
+    def set_min_duration_from_bpm(self):
+        """Set minimum note duration based on detected BPM"""
+        if self.bpm and self.bpm > 0:
+            beat_duration = 60.0 / self.bpm
+            suggested_32nd = int(beat_duration / 8 * 1000)  # 1/32 note in ms
+            self.min_note_duration_spin.setValue(suggested_32nd)
+            self.statusBar().showMessage(f'Min note set to {suggested_32nd}ms (1/32 note at {self.bpm:.0f} BPM)', 3000)
 
     def toggle_play(self):
         """Toggle play/pause"""
