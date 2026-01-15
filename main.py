@@ -1099,48 +1099,52 @@ class VisualizationWidget(FigureCanvas):
         """Update current playback position - optimized with blit rendering"""
         self.current_time = time
 
-        # Only update if we have position lines (after initial plot)
-        if self.position_line1 is not None and self.position_line2 is not None and self.position_line3 is not None:
-            # Try ultra-fast blit rendering first
-            if self.background1 is not None and self.background2 is not None and self.background3 is not None:
-                try:
-                    # Update position lines data
-                    self.position_line1.set_xdata([time, time])
-                    self.position_line2.set_xdata([time, time])
-                    self.position_line3.set_xdata([time, time])
+        # Only update if we have the basic position lines (after initial plot)
+        if self.position_line1 is None or self.position_line2 is None:
+            return  # Not ready yet, skip update
 
-                    # Restore cached backgrounds (fast!)
-                    self.figure.canvas.restore_region(self.background1)
-                    self.figure.canvas.restore_region(self.background2)
-                    self.figure.canvas.restore_region(self.background3)
-
-                    # Draw only the animated artists (position lines)
-                    self.ax1.draw_artist(self.position_line1)
-                    self.ax2.draw_artist(self.position_line2)
-                    self.ax3.draw_artist(self.position_line3)
-
-                    # Blit only the changed regions (extremely fast!)
-                    self.figure.canvas.blit(self.ax1.bbox)
-                    self.figure.canvas.blit(self.ax2.bbox)
-                    self.figure.canvas.blit(self.ax3.bbox)
-
-                    return  # Success! Exit early
-                except:
-                    # Blit failed, fall through to regular draw
-                    pass
-
-            # Fallback: regular update (slower but reliable)
+        # Try ultra-fast blit rendering first
+        if self.background1 is not None and self.background2 is not None:
             try:
+                # Update position lines data
                 self.position_line1.set_xdata([time, time])
                 self.position_line2.set_xdata([time, time])
-                self.position_line3.set_xdata([time, time])
-                self.draw()
+                if self.position_line3 is not None:
+                    self.position_line3.set_xdata([time, time])
+
+                # Restore cached backgrounds (fast!)
+                self.figure.canvas.restore_region(self.background1)
+                self.figure.canvas.restore_region(self.background2)
+                if self.background3 is not None:
+                    self.figure.canvas.restore_region(self.background3)
+
+                # Draw only the animated artists (position lines)
+                self.ax1.draw_artist(self.position_line1)
+                self.ax2.draw_artist(self.position_line2)
+                if self.position_line3 is not None:
+                    self.ax3.draw_artist(self.position_line3)
+
+                # Blit only the changed regions (extremely fast!)
+                self.figure.canvas.blit(self.ax1.bbox)
+                self.figure.canvas.blit(self.ax2.bbox)
+                if self.background3 is not None:
+                    self.figure.canvas.blit(self.ax3.bbox)
+
+                return  # Success! Exit early
             except:
-                # If even that fails, do nothing (prevents crashes during resize, etc.)
+                # Blit failed, fall through to regular draw
                 pass
-        else:
-            # Initial plot
-            self.plot()
+
+        # Fallback: regular update (slower but reliable)
+        try:
+            self.position_line1.set_xdata([time, time])
+            self.position_line2.set_xdata([time, time])
+            if self.position_line3 is not None:
+                self.position_line3.set_xdata([time, time])
+            self.draw()
+        except:
+            # If even that fails, do nothing (prevents crashes during resize, etc.)
+            pass
 
 
 class VocalCoachApp(QMainWindow):
