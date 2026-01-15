@@ -1341,11 +1341,11 @@ class VocalCoachApp(QMainWindow):
         # Min note duration
         pitch_row1.addWidget(QLabel('Min Note (ms):'))
         self.min_note_duration_spin = QSpinBox()
-        self.min_note_duration_spin.setRange(20, 500)
-        self.min_note_duration_spin.setValue(50)
-        self.min_note_duration_spin.setSingleStep(10)
+        self.min_note_duration_spin.setRange(10, 500)
+        self.min_note_duration_spin.setValue(30)
+        self.min_note_duration_spin.setSingleStep(5)
         self.min_note_duration_spin.setSuffix('ms')
-        self.min_note_duration_spin.setToolTip('Minimum note duration in milliseconds\nHigher = filters out very short detections (noise)\nLower = captures faster runs')
+        self.min_note_duration_spin.setToolTip('Minimum note duration in milliseconds\nHigher = filters out very short detections (noise)\nLower = captures faster runs and quick notes\nDefault: 30ms for vocal runs')
         pitch_row1.addWidget(self.min_note_duration_spin)
 
         # Vocal isolation toggle
@@ -1616,10 +1616,11 @@ class VocalCoachApp(QMainWindow):
 
         # Calculate min_note_duration based on BPM if available
         if self.bpm and self.bpm > 0:
-            # Use BPM to calculate minimum duration (1/16th note at detected BPM)
+            # Use BPM to calculate minimum duration (1/32nd note at detected BPM)
+            # This captures fast vocal runs and quick notes
             beat_duration = 60.0 / self.bpm
-            min_note_duration = beat_duration / 4  # Sixteenth note
-            self.statusBar().showMessage(f'Using BPM-based min note duration: {min_note_duration*1000:.0f}ms (BPM: {self.bpm:.0f})', 2000)
+            min_note_duration = beat_duration / 8  # Thirty-second note
+            self.statusBar().showMessage(f'Using BPM-based min note duration: {min_note_duration*1000:.0f}ms (1/32 note at {self.bpm:.0f} BPM)', 2000)
         else:
             # Fall back to manual setting
             min_note_duration = self.min_note_duration_spin.value() / 1000.0  # Convert ms to seconds
