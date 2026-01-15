@@ -2021,10 +2021,32 @@ def main():
         print(f"  TensorFlow version: {tensorflow.__version__}")
     except ImportError as e:
         print("✗ CREPE is NOT available")
-        print(f"  Error: {e}")
+        error_str = str(e)
+        print(f"  Error: {error_str}")
         print()
-        print("  To install CREPE, run:")
-        print(f"  {sys.executable} -m pip install crepe tensorflow")
+
+        # Check for specific TensorFlow DLL error
+        if "DLL load failed" in error_str or "_pywrap_tensorflow_internal" in error_str:
+            print("  🔍 DIAGNOSIS: TensorFlow DLL initialization failed (Windows)")
+            print("  This is caused by missing Visual C++ Redistributables.")
+            print()
+            print("  ⚠️  NOTE: This is NOT related to running from an external drive!")
+            print("  The issue is that Windows needs additional runtime libraries.")
+            print()
+            print("  ✅ SOLUTION 1 (Fix CREPE):")
+            print("  1. Download: https://aka.ms/vs/17/release/vc_redist.x64.exe")
+            print("  2. Install the Visual C++ Redistributable")
+            print("  3. Restart the app")
+            print()
+            print("  ✅ SOLUTION 2 (Use pYIN instead):")
+            print("  pYIN works great and has no DLL dependencies!")
+            print("  Just select 'pYIN' in the Algorithm dropdown.")
+        elif "No module named" in error_str:
+            print("  To install CREPE, run:")
+            print(f"  {sys.executable} -m pip install crepe tensorflow")
+        else:
+            print("  To fix, run:")
+            print(f"  {sys.executable} -m pip install crepe tensorflow")
     print("=" * 60)
     print()
 
