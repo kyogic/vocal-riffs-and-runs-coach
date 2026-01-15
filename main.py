@@ -1708,6 +1708,31 @@ class VocalCoachApp(QMainWindow):
                 self.statusBar().showMessage(f'Error exporting notes: {str(e)}')
                 print(f"Error exporting notes: {e}")
 
+    def play_all_notes(self):
+        """Play all detected notes as synthesized audio"""
+        if not self.notes_data:
+            self.statusBar().showMessage('No notes to play. Please analyze first.')
+            return
+
+        if self.is_playing_notes:
+            self.statusBar().showMessage('Note playback already in progress')
+            return
+
+        # Get tempo from UI
+        tempo = self.tempo_spin.value()
+
+        # Load all notes into note player
+        self.note_player.load_notes(self.notes_data, tempo)
+
+        # Update UI
+        self.is_playing_notes = True
+        self.play_all_notes_btn.setEnabled(False)
+        self.stop_notes_btn.setEnabled(True)
+        self.note_status_label.setText(f'Playing {len(self.notes_data)} notes...')
+
+        # Start playback
+        self.note_player.start()
+
     def stop_note_playback(self):
         """Stop note playback"""
         self.note_player.stop()
