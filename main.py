@@ -838,13 +838,14 @@ class VisualizationWidget(FigureCanvas):
     """Widget for displaying pitch visualization"""
 
     def __init__(self, parent=None):
-        self.figure = Figure(figsize=(10, 6))
+        self.figure = Figure(figsize=(10, 8))
         super().__init__(self.figure)
         self.setParent(parent)
 
-        # Create subplots
-        self.ax1 = self.figure.add_subplot(211)  # Waveform
-        self.ax2 = self.figure.add_subplot(212)  # Pitch
+        # Create subplots - now with 3 panels
+        self.ax1 = self.figure.add_subplot(311)  # Waveform
+        self.ax2 = self.figure.add_subplot(312)  # Pitch
+        self.ax3 = self.figure.add_subplot(313)  # Music Staff
 
         self.figure.tight_layout(pad=3.0)
 
@@ -855,22 +856,26 @@ class VisualizationWidget(FigureCanvas):
         self.notes = None
         self.runs = []
         self.current_time = 0
+        self.bpm = None  # Store BPM for note duration visualization
 
         # Store position line references for fast updates
         self.position_line1 = None
         self.position_line2 = None
+        self.position_line3 = None
 
         # Cache backgrounds for blit rendering
         self.background1 = None
         self.background2 = None
+        self.background3 = None
 
-    def update_data(self, audio, sr, times, f0, notes):
+    def update_data(self, audio, sr, times, f0, notes, bpm=None):
         """Update visualization with new data"""
         self.audio = audio
         self.sr = sr
         self.times = times
         self.f0 = f0
         self.notes = notes
+        self.bpm = bpm
         self.plot()
 
     def plot(self):
@@ -881,6 +886,7 @@ class VisualizationWidget(FigureCanvas):
         # Clear axes
         self.ax1.clear()
         self.ax2.clear()
+        self.ax3.clear()
 
         # Plot waveform
         time_axis = np.linspace(0, len(self.audio) / self.sr, len(self.audio))
@@ -938,6 +944,9 @@ class VisualizationWidget(FigureCanvas):
         # Plot current position line and store reference (animated for blit)
         self.position_line2 = self.ax2.axvline(x=self.current_time, color='r', linestyle='--', linewidth=2, animated=True)
 
+        # Plot music staff notation
+        self.plot_music_staff()
+
         # Draw the figure first
         self.draw()
 
@@ -946,34 +955,174 @@ class VisualizationWidget(FigureCanvas):
         try:
             self.background1 = self.figure.canvas.copy_from_bbox(self.ax1.bbox)
             self.background2 = self.figure.canvas.copy_from_bbox(self.ax2.bbox)
+            self.background3 = self.figure.canvas.copy_from_bbox(self.ax3.bbox)
         except:
             # If caching fails, that's ok, we'll fall back to regular draw
             pass
+
+    def plot_music_staff(self):
+        """Plot notes on a music staff with duration representation"""
+        if not self.notes:
+            self.ax3.text(0.5, 0.5, 'No notes detected yet',
+                         ha='center', va='center', transform=self.ax3.transAxes,
+                         fontsize=12, color='gray')
+            self.ax3.set_xlim(0, 1)
+            self.ax3.set_ylim(0, 1)
+            self.ax3.axis('off')
+            return
+
+        # Define staff lines (5 lines for treble clef)
+        staff_lines = [0, 2, 4, 6, 8]  # E4, G4, B4, D5, F5
+
+        # Note to position mapping (0 = E4, chromatic scale)
+        note_positions = {
+            'C': -3, 'C#': -2.5, 'Db': -2.5,
+            'D': -2, 'D#': -1.5, 'Eb': -1.5,
+            'E': -1,
+            'F': 0, 'F#': 0.5, 'Gb': 0.5,
+            'G': 1, 'G#': 1.5, 'Ab': 1.5,
+            'A': 2, 'A#': 2.5, 'Bb': 2.5,
+            'B': 3
+        }
+
+        # Draw staff lines
+        if self.times is not None and len(self.times) > 0:
+            time_min = min(note['time'] for note in self.notes)
+            time_max = max(note['time'] + note['duration'] for note in self.notes)
+            padding = (time_max - time_min) * 0.05
+            x_min, x_max = max(0, time_min - padding), time_max + padding
+        else:
+            x_min, x_max = 0, 10
+
+        for line_y in staff_lines:
+            self.ax3.plot([x_min, x_max], [line_y, line_y], 'k-', linewidth=0.8, alpha=0.5)
+
+        # Calculate note duration categories based on BPM if available
+        if self.bpm and self.bpm > 0:
+            beat_duration = 60.0 / self.bpm  # Duration of quarter note in seconds
+            duration_thresholds = {
+                'whole': beat_duration * 4,
+                'half': beat_duration * 2,
+                'quarter': beat_duration,
+                'eighth': beat_duration / 2,
+                'sixteenth': beat_duration / 4
+            }
+        else:
+            # Default thresholds if no BPM
+            duration_thresholds = {
+                'whole': 2.0,
+                'half': 1.0,
+                'quarter': 0.5,
+                'eighth': 0.25,
+                'sixteenth': 0.125
+            }
+
+        # Plot notes on staff
+        for note in self.notes:
+            # Extract note name without octave
+            note_name = note['note'][:-1] if note['note'][-1].isdigit() else note['note']
+            octave = int(note['note'][-1]) if note['note'][-1].isdigit() else 4
+
+            # Calculate position on staff
+            base_pos = note_positions.get(note_name, 0)
+            # Adjust for octave (E4 is base, each octave = 7 staff positions)
+            staff_pos = base_pos + (octave - 4) * 7
+
+            x_start = note['time']
+            x_end = note['time'] + note['duration']
+            duration = note['duration']
+
+            # Determine note symbol based on duration
+            if duration >= duration_thresholds['half']:
+                note_symbol = 'o'  # Whole/half note (hollow)
+                size = 120
+                edge_color = 'black'
+                face_color = 'white'
+                edge_width = 2
+            elif duration >= duration_thresholds['quarter']:
+                note_symbol = 'o'  # Quarter note
+                size = 100
+                edge_color = 'black'
+                face_color = 'black'
+                edge_width = 1
+            elif duration >= duration_thresholds['eighth']:
+                note_symbol = 'o'  # Eighth note
+                size = 80
+                edge_color = 'black'
+                face_color = 'black'
+                edge_width = 1
+            else:
+                note_symbol = 'o'  # Sixteenth+ note
+                size = 60
+                edge_color = 'darkred'
+                face_color = 'darkred'
+                edge_width = 1
+
+            # Draw note head at start time
+            self.ax3.scatter(x_start, staff_pos, s=size, marker=note_symbol,
+                           edgecolors=edge_color, facecolors=face_color,
+                           linewidths=edge_width, zorder=10)
+
+            # Draw duration line
+            self.ax3.plot([x_start, x_end], [staff_pos, staff_pos],
+                         color='blue', linewidth=2, alpha=0.4, zorder=5)
+
+            # Add note label above
+            self.ax3.text(x_start, staff_pos + 0.8, note['note'],
+                         ha='center', va='bottom', fontsize=7, fontweight='bold')
+
+            # Add duration label below
+            dur_text = f"{duration:.2f}s"
+            self.ax3.text(x_start, staff_pos - 0.8, dur_text,
+                         ha='center', va='top', fontsize=6, color='gray')
+
+        # Set limits and labels
+        self.ax3.set_xlim(x_min, x_max)
+        self.ax3.set_ylim(-5, 13)
+        self.ax3.set_xlabel('Time (s)')
+        self.ax3.set_ylabel('Pitch')
+
+        title = 'Musical Staff Notation'
+        if self.bpm:
+            title += f' (BPM: {self.bpm:.0f})'
+        self.ax3.set_title(title)
+
+        # Remove y-axis ticks (staff lines are enough)
+        self.ax3.set_yticks(staff_lines)
+        self.ax3.set_yticklabels(['E', 'G', 'B', 'D', 'F'])
+
+        # Add position line
+        self.position_line3 = self.ax3.axvline(x=self.current_time, color='r',
+                                               linestyle='--', linewidth=2, animated=True)
 
     def update_position(self, time):
         """Update current playback position - optimized with blit rendering"""
         self.current_time = time
 
         # Only update if we have position lines (after initial plot)
-        if self.position_line1 is not None and self.position_line2 is not None:
+        if self.position_line1 is not None and self.position_line2 is not None and self.position_line3 is not None:
             # Try ultra-fast blit rendering first
-            if self.background1 is not None and self.background2 is not None:
+            if self.background1 is not None and self.background2 is not None and self.background3 is not None:
                 try:
                     # Update position lines data
                     self.position_line1.set_xdata([time, time])
                     self.position_line2.set_xdata([time, time])
+                    self.position_line3.set_xdata([time, time])
 
                     # Restore cached backgrounds (fast!)
                     self.figure.canvas.restore_region(self.background1)
                     self.figure.canvas.restore_region(self.background2)
+                    self.figure.canvas.restore_region(self.background3)
 
                     # Draw only the animated artists (position lines)
                     self.ax1.draw_artist(self.position_line1)
                     self.ax2.draw_artist(self.position_line2)
+                    self.ax3.draw_artist(self.position_line3)
 
                     # Blit only the changed regions (extremely fast!)
                     self.figure.canvas.blit(self.ax1.bbox)
                     self.figure.canvas.blit(self.ax2.bbox)
+                    self.figure.canvas.blit(self.ax3.bbox)
 
                     return  # Success! Exit early
                 except:
@@ -984,6 +1133,7 @@ class VisualizationWidget(FigureCanvas):
             try:
                 self.position_line1.set_xdata([time, time])
                 self.position_line2.set_xdata([time, time])
+                self.position_line3.set_xdata([time, time])
                 self.draw()
             except:
                 # If even that fails, do nothing (prevents crashes during resize, etc.)
@@ -1204,24 +1354,21 @@ class VocalCoachApp(QMainWindow):
 
         pitch_row2.addWidget(QLabel('Analyze Region:'))
 
-        pitch_row2.addWidget(QLabel('Start (s):'))
-        self.start_time_spin = QDoubleSpinBox()
-        self.start_time_spin.setRange(0.0, 9999.0)
-        self.start_time_spin.setValue(0.0)
-        self.start_time_spin.setSingleStep(1.0)
-        self.start_time_spin.setDecimals(1)
-        self.start_time_spin.setToolTip('Start time for analysis (0 = beginning)')
-        pitch_row2.addWidget(self.start_time_spin)
+        pitch_row2.addWidget(QLabel('Start:'))
+        self.start_time_input = QLineEdit()
+        self.start_time_input.setText('00:00')
+        self.start_time_input.setMaximumWidth(80)
+        self.start_time_input.setPlaceholderText('MM:SS')
+        self.start_time_input.setToolTip('Start time for analysis (MM:SS format, 00:00 = beginning)')
+        pitch_row2.addWidget(self.start_time_input)
 
-        pitch_row2.addWidget(QLabel('End (s):'))
-        self.end_time_spin = QDoubleSpinBox()
-        self.end_time_spin.setRange(0.0, 9999.0)
-        self.end_time_spin.setValue(0.0)
-        self.end_time_spin.setSingleStep(1.0)
-        self.end_time_spin.setDecimals(1)
-        self.end_time_spin.setSpecialValueText('End')
-        self.end_time_spin.setToolTip('End time for analysis (0 = full track)')
-        pitch_row2.addWidget(self.end_time_spin)
+        pitch_row2.addWidget(QLabel('End:'))
+        self.end_time_input = QLineEdit()
+        self.end_time_input.setText('00:00')
+        self.end_time_input.setMaximumWidth(80)
+        self.end_time_input.setPlaceholderText('MM:SS')
+        self.end_time_input.setToolTip('End time for analysis (MM:SS format, 00:00 = full track)')
+        pitch_row2.addWidget(self.end_time_input)
 
         self.set_start_btn = QPushButton('← Set Start')
         self.set_start_btn.clicked.connect(self.set_start_to_current_position)
@@ -1422,22 +1569,22 @@ class VocalCoachApp(QMainWindow):
 
     def reset_analysis_region(self):
         """Reset the analysis region to full track"""
-        self.start_time_spin.setValue(0.0)
-        self.end_time_spin.setValue(0.0)
+        self.start_time_input.setText('00:00')
+        self.end_time_input.setText('00:00')
 
     def set_start_to_current_position(self):
         """Set the start time to current playback position"""
         if hasattr(self, 'audio_player'):
             current_pos = self.audio_player.current_position
-            self.start_time_spin.setValue(round(current_pos, 1))
-            self.statusBar().showMessage(f'Start time set to {current_pos:.1f}s', 2000)
+            self.start_time_input.setText(self.format_time(current_pos))
+            self.statusBar().showMessage(f'Start time set to {self.format_time(current_pos)}', 2000)
 
     def set_end_to_current_position(self):
         """Set the end time to current playback position"""
         if hasattr(self, 'audio_player'):
             current_pos = self.audio_player.current_position
-            self.end_time_spin.setValue(round(current_pos, 1))
-            self.statusBar().showMessage(f'End time set to {current_pos:.1f}s', 2000)
+            self.end_time_input.setText(self.format_time(current_pos))
+            self.statusBar().showMessage(f'End time set to {self.format_time(current_pos)}', 2000)
 
     def analyze_pitch(self):
         """Analyze pitch from the loaded audio"""
@@ -1458,15 +1605,37 @@ class VocalCoachApp(QMainWindow):
         energy_threshold = self.energy_threshold_spin.value()
         isolate_vocals = self.isolate_vocals_checkbox.isChecked()
         algorithm = self.algorithm_combo.currentData()
-        min_note_duration = self.min_note_duration_spin.value() / 1000.0  # Convert ms to seconds
 
-        # Get region selection
-        start_time = self.start_time_spin.value() if self.start_time_spin.value() > 0 else None
-        end_time = self.end_time_spin.value() if self.end_time_spin.value() > 0 else None
+        # Calculate min_note_duration based on BPM if available
+        if self.bpm and self.bpm > 0:
+            # Use BPM to calculate minimum duration (1/16th note at detected BPM)
+            beat_duration = 60.0 / self.bpm
+            min_note_duration = beat_duration / 4  # Sixteenth note
+            self.statusBar().showMessage(f'Using BPM-based min note duration: {min_note_duration*1000:.0f}ms (BPM: {self.bpm:.0f})', 2000)
+        else:
+            # Fall back to manual setting
+            min_note_duration = self.min_note_duration_spin.value() / 1000.0  # Convert ms to seconds
+
+        # Get region selection (parse MM:SS format)
+        start_time = self.parse_mmss(self.start_time_input.text())
+        end_time = self.parse_mmss(self.end_time_input.text())
 
         # Validate region
         if end_time is not None and start_time is not None and end_time <= start_time:
             self.statusBar().showMessage('Error: End time must be greater than start time')
+            self.analyze_btn.setEnabled(True)
+            self.analysis_progress.setVisible(False)
+            return
+
+        # Validate format
+        if start_time is None and self.start_time_input.text().strip() and self.start_time_input.text().strip() != '00:00':
+            self.statusBar().showMessage('Error: Invalid start time format. Use MM:SS')
+            self.analyze_btn.setEnabled(True)
+            self.analysis_progress.setVisible(False)
+            return
+
+        if end_time is None and self.end_time_input.text().strip() and self.end_time_input.text().strip() != '00:00':
+            self.statusBar().showMessage('Error: Invalid end time format. Use MM:SS')
             self.analyze_btn.setEnabled(True)
             self.analysis_progress.setVisible(False)
             return
@@ -1506,8 +1675,8 @@ class VocalCoachApp(QMainWindow):
         self.times = times
         self.f0 = f0
 
-        # Update visualization
-        self.viz_widget.update_data(self.audio, self.sr, times, f0, notes)
+        # Update visualization (pass BPM if available for note duration visualization)
+        self.viz_widget.update_data(self.audio, self.sr, times, f0, notes, self.bpm)
 
         # Enable export
         self.export_btn.setEnabled(True)
@@ -1668,6 +1837,26 @@ class VocalCoachApp(QMainWindow):
         minutes = int(seconds // 60)
         secs = int(seconds % 60)
         return f'{minutes}:{secs:02d}'
+
+    def parse_mmss(self, mmss_str):
+        """Parse MM:SS format to seconds. Returns None if invalid."""
+        try:
+            mmss_str = mmss_str.strip()
+            if not mmss_str or mmss_str == '00:00':
+                return None
+
+            if ':' in mmss_str:
+                parts = mmss_str.split(':')
+                if len(parts) == 2:
+                    minutes = int(parts[0])
+                    seconds = int(parts[1])
+                    return minutes * 60 + seconds
+            else:
+                # If no colon, assume seconds
+                return float(mmss_str)
+        except:
+            return None
+        return None
 
     def export_notes(self):
         """Export detected notes to a file"""
