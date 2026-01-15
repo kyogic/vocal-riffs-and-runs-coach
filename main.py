@@ -662,11 +662,20 @@ class AudioPlayer(QThread):
         self.current_position = 0
         self.stop_flag = False
         self.stream = None
+        self.loop_enabled = False
+        self.loop_start = None
+        self.loop_end = None
 
     def load_audio(self, audio, sr):
         self.audio = audio
         self.sr = sr
         self.current_position = 0
+
+    def set_loop_region(self, enabled, start_time=None, end_time=None):
+        """Set loop region for playback"""
+        self.loop_enabled = enabled
+        self.loop_start = start_time
+        self.loop_end = end_time
 
     def run(self):
         """Play audio using sounddevice"""
@@ -682,38 +691,59 @@ class AudioPlayer(QThread):
             sd.default.latency = 'high'  # Prioritize smooth playback over low latency
             sd.default.device = None  # Use default device
 
-            # Start from current position
-            start_sample = int(self.current_position * self.sr)
-            audio_chunk = self.audio[start_sample:]
-
             # Reset stop flag
             self.stop_flag = False
 
-            # Play audio with blocking=False and capture the stream
-            sd.play(audio_chunk, self.sr, blocking=False)
-            stream = sd.get_stream()  # Get the actual stream object
+            # Determine playback region
+            if self.loop_enabled and self.loop_start is not None:
+                # Loop mode: play selected region
+                region_start = self.loop_start
+                region_end = self.loop_end if self.loop_end else len(self.audio) / self.sr
+            else:
+                # Normal mode: play from current position to end
+                region_start = self.current_position
+                region_end = len(self.audio) / self.sr
 
-            # Track start time for position calculation
             import time
-            playback_start_time = time.time()
-            initial_position = start_sample / self.sr
 
-            # Update position while playing (less frequently to reduce overhead)
+            # Loop playback if enabled
             while not self.stop_flag:
-                # Check if still playing using the captured stream
-                if not stream.active:
+                # Calculate samples for this iteration
+                start_sample = int(region_start * self.sr)
+                end_sample = int(region_end * self.sr)
+                audio_chunk = self.audio[start_sample:end_sample]
+
+                # Play audio with blocking=False and capture the stream
+                sd.play(audio_chunk, self.sr, blocking=False)
+                stream = sd.get_stream()  # Get the actual stream object
+
+                # Track start time for position calculation
+                playback_start_time = time.time()
+                initial_position = region_start
+
+                # Update position while playing this chunk
+                while not self.stop_flag:
+                    # Check if still playing using the captured stream
+                    if not stream.active:
+                        break
+
+                    # Calculate current position based on elapsed time
+                    elapsed_time = time.time() - playback_start_time
+                    self.current_position = initial_position + elapsed_time
+                    self.position_changed.emit(self.current_position)
+
+                    # Update every 200ms for smoother visual feedback without overhead
+                    self.msleep(200)
+
+                # If not looping, exit after one playback
+                if not self.loop_enabled:
                     break
 
-                # Calculate current position based on elapsed time
-                # This is more reliable than querying the stream
-                elapsed_time = time.time() - playback_start_time
-                self.current_position = initial_position + elapsed_time
-                self.position_changed.emit(self.current_position)
+                # Wait a tiny bit before looping to avoid audio glitches
+                if not self.stop_flag:
+                    self.msleep(50)
 
-                # Update every 200ms for smoother visual feedback without overhead
-                self.msleep(200)
-
-            # Wait for playback to finish if not stopped
+            # Clean up
             if not self.stop_flag:
                 sd.wait()
                 self.finished.emit()
@@ -1266,6 +1296,10 @@ class VocalCoachApp(QMainWindow):
         self.stop_btn.clicked.connect(self.stop_playback)
         self.stop_btn.setEnabled(False)
 
+        self.loop_region_checkbox = QCheckBox('🔁 Loop Region')
+        self.loop_region_checkbox.setToolTip('Loop the selected region (start/end times above)')
+        self.loop_region_checkbox.setEnabled(False)
+
         self.analyze_btn = QPushButton('🔍 Analyze Pitch')
         self.analyze_btn.clicked.connect(self.analyze_pitch)
         self.analyze_btn.setEnabled(False)
@@ -1282,6 +1316,7 @@ class VocalCoachApp(QMainWindow):
         controls_layout.addStretch()
         controls_layout.addWidget(self.play_btn)
         controls_layout.addWidget(self.stop_btn)
+        controls_layout.addWidget(self.loop_region_checkbox)
         controls_layout.addWidget(self.analyze_btn)
         controls_layout.addWidget(self.detect_bpm_btn)
         controls_layout.addWidget(self.export_btn)
@@ -1469,6 +1504,7 @@ class VocalCoachApp(QMainWindow):
                 # Update UI
                 self.file_label.setText(f'Loaded: {os.path.basename(file_path)}')
                 self.play_btn.setEnabled(True)
+                self.loop_region_checkbox.setEnabled(True)
                 self.analyze_btn.setEnabled(True)
                 self.detect_bpm_btn.setEnabled(True)
                 self.progress_bar.setValue(0)
@@ -1536,6 +1572,7 @@ class VocalCoachApp(QMainWindow):
             filename = os.path.basename(file_path)
             self.file_label.setText(f'Loaded from YouTube: {filename}')
             self.play_btn.setEnabled(True)
+            self.loop_region_checkbox.setEnabled(True)
             self.analyze_btn.setEnabled(True)
             self.detect_bpm_btn.setEnabled(True)
             self.progress_bar.setValue(0)
@@ -1773,6 +1810,29 @@ class VocalCoachApp(QMainWindow):
         """Start audio playback"""
         if self.audio is None:
             return
+
+        # Get loop region settings
+        loop_enabled = self.loop_region_checkbox.isChecked()
+        start_time = None
+        end_time = None
+
+        if loop_enabled:
+            # Parse start/end times from inputs
+            start_text = self.start_time_input.text().strip()
+            end_text = self.end_time_input.text().strip()
+
+            if start_text and start_text != '00:00':
+                start_time = self.parse_mmss(start_text)
+            else:
+                start_time = 0
+
+            if end_text and end_text != '00:00':
+                end_time = self.parse_mmss(end_text)
+            else:
+                end_time = None  # Play to end
+
+        # Set loop region in audio player
+        self.audio_player.set_loop_region(loop_enabled, start_time, end_time)
 
         self.is_playing = True
         self.play_btn.setText('⏸ Pause')
